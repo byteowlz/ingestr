@@ -1,0 +1,6 @@
+# Example configuration for the ingestr MCP server.
+# Copy to $XDG_CONFIG_HOME/ingestr-mcp/config.toml (or ~/.config/ingestr-mcp/config.toml).
+
+[index]
+# Path to the Tantivy index built by ingestr-cli.
+index_dir = "$XDG_DATA_HOME/ingestr-cli/index"

@@ -1,0 +1,30 @@
+# Example configuration for the ingestr markdown service.
+# Copy to $XDG_CONFIG_HOME/ingestr-cli/config.toml (or ~/.config/ingestr-cli/config.toml).
+
+profile = "default"
+
+[logging]
+# Valid levels: error, warn, info, debug, trace
+level = "info"
+# file = "~/Library/Logs/ingestr-cli.log"
+
+[runtime]
+# parallelism = 8
+timeout = 60
+fail_fast = true
+
+[watcher]
+watch_dir = "~/Documents"
+debounce_ms = 750
+skip_hidden = true
+
+[output]
+markdown_dir = "~/markdown"
+
+[index]
+enabled = true
+# index_dir = "$XDG_DATA_HOME/ingestr-cli/index"
+
+[paths]
+# data_dir = "$XDG_DATA_HOME/ingestr-cli"
+# state_dir = "$XDG_STATE_HOME/ingestr-cli"

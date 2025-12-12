@@ -1,0 +1,3 @@
+[workspace]
+members = ["ingestr-cli", "ingestr-core", "ingestr-mcp"]
+resolver = "3"
