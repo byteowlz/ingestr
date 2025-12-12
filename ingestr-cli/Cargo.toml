@@ -1,0 +1,30 @@
+[package]
+name = "ingestr-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ingestr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.49", features = ["derive", "env"] }
+clap_complete = "4.5.23"
+config = { version = "0.15.18", features = ["toml"] }
+ctrlc = "3.4.5"
+dirs = "5.0.1"
+env_logger = "0.11.5"
+log = "0.4.22"
+markitdown = "0.1.10"
+notify = "8.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tantivy = "0.22.0"
+shellexpand = "3.1.0"
+serde_yaml = "0.9.34"
+toml = "0.8.19"
+walkdir = "2.5.0"
+time = { version = "0.3.37", features = ["formatting"] }
+ingestr-core = { path = "../ingestr-core" }
+sysinfo = "0.30.13"
