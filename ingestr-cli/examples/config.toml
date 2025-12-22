@@ -28,3 +28,15 @@ enabled = true
 [paths]
 # data_dir = "$XDG_DATA_HOME/ingestr-cli"
 # state_dir = "$XDG_STATE_HOME/ingestr-cli"
+
+[llm]
+# Enable LLM-based image description generation
+enabled = false
+# LLM provider: "openai", "gemini", or "deepseek"
+client = "openai"
+# Model name (e.g., "gpt-4o", "gemini-1.5-flash", "deepseek-chat")
+model = "gpt-4o"
+# Custom API base URL (for OpenAI-compatible endpoints, local LLMs, etc.)
+# base_url = "http://localhost:11434/v1"
+# API key (can also use environment variables: OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY)
+# api_key = "sk-..."
