@@ -18,7 +18,7 @@ use config::{Config, Environment, File, FileFormat};
 use env_logger::fmt::WriteStyle;
 use ingestr_core::{IndexedDocument, SearchIndex};
 use log::{LevelFilter, debug, info, warn};
-use markitdown::MarkItDown;
+use markitdown::{model::ConversionOptions, MarkItDown};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, Signal, System};
@@ -361,6 +361,11 @@ impl RuntimeContext {
             skip_hidden: self.config.watcher.skip_hidden,
             data_dir: self.paths.data_dir.clone(),
             state_dir: self.paths.state_dir.clone(),
+            llm_enabled: self.config.llm.enabled,
+            llm_client: self.config.llm.client.clone(),
+            llm_model: self.config.llm.model.clone(),
+            llm_base_url: self.config.llm.base_url.clone(),
+            llm_api_key: self.config.llm.api_key.clone(),
         })
     }
 }
@@ -427,6 +432,7 @@ struct AppConfig {
     watcher: WatcherConfig,
     output: OutputConfig,
     index: IndexConfig,
+    llm: LlmConfig,
 }
 
 impl AppConfig {
@@ -448,6 +454,7 @@ impl Default for AppConfig {
             watcher: WatcherConfig::default(),
             output: OutputConfig::default(),
             index: IndexConfig::default(),
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -537,6 +544,33 @@ impl Default for IndexConfig {
         Self {
             enabled: true,
             index_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct LlmConfig {
+    /// Enable LLM-based image description generation
+    enabled: bool,
+    /// LLM provider: "openai", "gemini", or "deepseek"
+    client: String,
+    /// Model name (e.g., "gpt-4o", "gemini-1.5-flash", "deepseek-chat")
+    model: String,
+    /// Custom API base URL (for OpenAI-compatible endpoints)
+    base_url: Option<String>,
+    /// API key (optional, can also use environment variables)
+    api_key: Option<String>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            base_url: None,
+            api_key: None,
         }
     }
 }
@@ -992,6 +1026,11 @@ struct ServiceSettings {
     skip_hidden: bool,
     data_dir: PathBuf,
     state_dir: PathBuf,
+    llm_enabled: bool,
+    llm_client: String,
+    llm_model: String,
+    llm_base_url: Option<String>,
+    llm_api_key: Option<String>,
 }
 
 impl ResolvedDirectories {
@@ -1020,6 +1059,9 @@ struct ConversionService {
 
 impl ConversionService {
     fn new(settings: ServiceSettings) -> Result<Self> {
+        // Set LLM environment variables from config if provided
+        Self::configure_llm_env(&settings);
+
         let indexer = if settings.index_enabled {
             Some(SearchIndex::open(&settings.index_dir, true)?)
         } else {
@@ -1031,6 +1073,37 @@ impl ConversionService {
             markitdown: MarkItDown::new(),
             indexer,
         })
+    }
+
+    fn configure_llm_env(settings: &ServiceSettings) {
+        if !settings.llm_enabled {
+            return;
+        }
+
+        // Set API key environment variable based on provider
+        if let Some(ref api_key) = settings.llm_api_key {
+            let env_var = match settings.llm_client.as_str() {
+                "openai" => "OPENAI_API_KEY",
+                "gemini" => "GEMINI_API_KEY",
+                "deepseek" => "DEEPSEEK_API_KEY",
+                _ => "OPENAI_API_KEY",
+            };
+            // SAFETY: This is called at service startup before any threads are spawned,
+            // and we control the environment variable names being set.
+            unsafe {
+                env::set_var(env_var, api_key);
+            }
+        }
+
+        // Set base URL environment variable (OpenAI-compatible format)
+        if let Some(ref base_url) = settings.llm_base_url {
+            // SAFETY: This is called at service startup before any threads are spawned,
+            // and we control the environment variable names being set.
+            unsafe {
+                env::set_var("OPENAI_API_BASE", base_url);
+                env::set_var("OPENAI_BASE_URL", base_url);
+            }
+        }
     }
 
     fn run(&mut self) -> Result<()> {
@@ -1162,10 +1235,21 @@ impl ConversionService {
             return Ok(());
         }
 
+        let conversion_opts = if self.settings.llm_enabled {
+            Some(ConversionOptions {
+                file_extension: None,
+                url: None,
+                llm_client: Some(self.settings.llm_client.clone()),
+                llm_model: Some(self.settings.llm_model.clone()),
+            })
+        } else {
+            None
+        };
+
         let converted = match self.markitdown.convert(
             path.to_str()
                 .ok_or_else(|| anyhow!("invalid path encoding for {}", path.display()))?,
-            None,
+            conversion_opts,
         ) {
             Some(result) => result,
             None => {
