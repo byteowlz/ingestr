@@ -18,3 +18,6 @@ time = { version = "0.3.37", features = ["formatting"] }
 toml = "0.8.19"
 ingestr-core = { path = "../ingestr-core" }
 sysinfo = "0.30.13"
+
+[dev-dependencies]
+tempfile = "3"

@@ -78,17 +78,10 @@ impl AppPaths {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 #[serde(default)]
 struct AppConfig {
     index: IndexConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            index: IndexConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,9 +136,9 @@ fn run_server(mut index: SearchIndex) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
-    let mut lines = stdin.lock().lines();
+    let lines = stdin.lock().lines();
 
-    while let Some(line) = lines.next() {
+    for line in lines {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -479,11 +472,11 @@ fn ensure_service_running(paths: &AppPaths, index_dir: &Path) -> Result<()> {
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(2) {
-        if let Some(pid) = read_pid(&pid_path)? {
-            if process_running(pid) {
-                info!("ingestr service started pid {}", pid);
-                return Ok(());
-            }
+        if let Some(pid) = read_pid(&pid_path)?
+            && process_running(pid)
+        {
+            info!("ingestr service started pid {}", pid);
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -520,17 +513,18 @@ fn output_mcp_config() -> Result<()> {
 }
 
 fn which_ingestr_mcp() -> Result<String> {
-    if let Ok(current) = env::current_exe() {
-        if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
-            if name.contains("ingestr-mcp") {
-                return Ok(current.display().to_string());
-            }
-        }
-        if let Some(parent) = current.parent() {
-            let sibling = parent.join("ingestr-mcp");
-            if sibling.is_file() {
-                return Ok(sibling.display().to_string());
-            }
+    if let Ok(current) = env::current_exe()
+        && let Some(name) = current.file_name().and_then(|n| n.to_str())
+        && name.contains("ingestr-mcp")
+    {
+        return Ok(current.display().to_string());
+    }
+    if let Ok(current) = env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let sibling = parent.join("ingestr-mcp");
+        if sibling.is_file() {
+            return Ok(sibling.display().to_string());
         }
     }
 
@@ -546,12 +540,12 @@ fn which_ingestr_mcp() -> Result<String> {
 }
 
 fn which_ingestr_cli() -> Result<String> {
-    if let Ok(current) = env::current_exe() {
-        if let Some(parent) = current.parent() {
-            let sibling = parent.join("ingestr");
-            if sibling.is_file() {
-                return Ok(sibling.display().to_string());
-            }
+    if let Ok(current) = env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let sibling = parent.join("ingestr");
+        if sibling.is_file() {
+            return Ok(sibling.display().to_string());
         }
     }
 

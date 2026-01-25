@@ -1,25 +1,27 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcCommand, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, RecvTimeoutError},
 };
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use config::{Config, Environment, File, FileFormat};
 use env_logger::fmt::WriteStyle;
 use ingestr_core::{IndexedDocument, SearchIndex};
-use log::{LevelFilter, debug, info, warn};
-use markitdown::{model::ConversionOptions, MarkItDown};
+use log::{LevelFilter, debug, error, info, warn};
+use markitdown::{MarkItDown, model::ConversionOptions};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, Signal, System};
 use time::OffsetDateTime;
@@ -46,6 +48,7 @@ fn try_main() -> Result<()> {
     match cli.command {
         Command::Service { command } => handle_service(&mut ctx, command),
         Command::Search(cmd) => handle_search(&ctx, cmd),
+        Command::Convert(cmd) => handle_convert(&ctx, cmd),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
@@ -131,6 +134,8 @@ enum Command {
     },
     /// Query the search index
     Search(SearchCommand),
+    /// Convert a single file to Markdown
+    Convert(ConvertCommand),
     /// Create config directories and default files
     Init(InitCommand),
     /// Inspect and manage configuration
@@ -188,6 +193,93 @@ struct SearchCommand {
     /// Override the index directory
     #[arg(long, value_name = "PATH")]
     index_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ConvertCommand {
+    /// File or directory to convert (use '-' or omit for stdin)
+    #[arg(value_name = "INPUT")]
+    input: Option<PathBuf>,
+    /// Write output to a file or directory instead of stdout
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Input format hint when reading from stdin
+    #[arg(long, value_name = "FORMAT", value_enum)]
+    from: Option<InputFormat>,
+    /// Recursively process directories
+    #[arg(short, long)]
+    recursive: bool,
+    /// File extensions to process (comma-separated, e.g., "pdf,docx,html")
+    #[arg(long, value_name = "EXTENSIONS", value_delimiter = ',')]
+    extensions: Option<Vec<String>>,
+    /// Enable VLM processing for images
+    #[arg(long)]
+    vlm: bool,
+    /// Custom VLM prompt for image description
+    #[arg(long, value_name = "PROMPT")]
+    vlm_prompt: Option<String>,
+    /// Enable OCR processing for scanned documents
+    #[arg(long)]
+    ocr: bool,
+    /// OCR backend to use
+    #[arg(long, value_name = "BACKEND", value_enum, default_value = "tesseract")]
+    ocr_backend: OcrBackend,
+    /// OCR languages (comma-separated, e.g., "eng,deu")
+    #[arg(long, value_name = "LANGS", value_delimiter = ',')]
+    ocr_languages: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum InputFormat {
+    #[default]
+    Auto,
+    Html,
+    Text,
+    Pdf,
+    Docx,
+    Xlsx,
+    Pptx,
+    Csv,
+    Json,
+    Xml,
+    Markdown,
+}
+
+impl InputFormat {
+    fn extension(&self) -> Option<&'static str> {
+        match self {
+            InputFormat::Auto => None,
+            InputFormat::Html => Some("html"),
+            InputFormat::Text => Some("txt"),
+            InputFormat::Pdf => Some("pdf"),
+            InputFormat::Docx => Some("docx"),
+            InputFormat::Xlsx => Some("xlsx"),
+            InputFormat::Pptx => Some("pptx"),
+            InputFormat::Csv => Some("csv"),
+            InputFormat::Json => Some("json"),
+            InputFormat::Xml => Some("xml"),
+            InputFormat::Markdown => Some("md"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OcrBackend {
+    #[default]
+    Tesseract,
+    Surya,
+    Easyocr,
+}
+
+impl std::fmt::Display for OcrBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OcrBackend::Tesseract => write!(f, "tesseract"),
+            OcrBackend::Surya => write!(f, "surya"),
+            OcrBackend::Easyocr => write!(f, "easyocr"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -366,6 +458,7 @@ impl RuntimeContext {
             llm_model: self.config.llm.model.clone(),
             llm_base_url: self.config.llm.base_url.clone(),
             llm_api_key: self.config.llm.api_key.clone(),
+            processors: self.config.processors.clone(),
         })
     }
 }
@@ -433,6 +526,7 @@ struct AppConfig {
     output: OutputConfig,
     index: IndexConfig,
     llm: LlmConfig,
+    processors: ProcessorsConfig,
 }
 
 impl AppConfig {
@@ -455,6 +549,7 @@ impl Default for AppConfig {
             output: OutputConfig::default(),
             index: IndexConfig::default(),
             llm: LlmConfig::default(),
+            processors: ProcessorsConfig::default(),
         }
     }
 }
@@ -571,6 +666,95 @@ impl Default for LlmConfig {
             model: "gpt-4o".to_string(),
             base_url: None,
             api_key: None,
+        }
+    }
+}
+
+/// Processor pipeline configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ProcessorsConfig {
+    /// Ordered list of processors to try
+    pipeline: Vec<String>,
+    /// File type routing rules (extension -> processor list)
+    routing: HashMap<String, Vec<String>>,
+    /// VLM processor configuration
+    vlm: VlmConfig,
+    /// OCR processor configuration
+    ocr: OcrConfig,
+}
+
+impl Default for ProcessorsConfig {
+    fn default() -> Self {
+        Self {
+            pipeline: vec!["markitdown".to_string()],
+            routing: HashMap::new(),
+            vlm: VlmConfig::default(),
+            ocr: OcrConfig::default(),
+        }
+    }
+}
+
+/// VLM (Vision Language Model) processor configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct VlmConfig {
+    /// Enable VLM processing
+    enabled: bool,
+    /// EAVS server URL
+    eavs_url: String,
+    /// Provider to use (ollama, openai, anthropic)
+    provider: String,
+    /// Model name
+    model: String,
+    /// Custom prompts per file type
+    prompts: HashMap<String, String>,
+}
+
+impl Default for VlmConfig {
+    fn default() -> Self {
+        let mut prompts = HashMap::new();
+        prompts.insert(
+            "default".to_string(),
+            "Describe this image in detail, including any text visible.".to_string(),
+        );
+        prompts.insert(
+            "diagram".to_string(),
+            "Describe this diagram, including its structure, labels, and relationships.".to_string(),
+        );
+        prompts.insert(
+            "screenshot".to_string(),
+            "Describe this screenshot, including the UI elements and any visible text.".to_string(),
+        );
+
+        Self {
+            enabled: false,
+            eavs_url: "http://localhost:3000".to_string(),
+            provider: "ollama".to_string(),
+            model: "llava".to_string(),
+            prompts,
+        }
+    }
+}
+
+/// OCR processor configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct OcrConfig {
+    /// Enable OCR processing
+    enabled: bool,
+    /// OCR backend (tesseract, surya, easyocr)
+    backend: OcrBackend,
+    /// Languages for OCR
+    languages: Vec<String>,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: OcrBackend::Tesseract,
+            languages: vec!["eng".to_string()],
         }
     }
 }
@@ -778,13 +962,829 @@ fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
                 "- {} (score {:.2}) -> {}",
                 hit.title
                     .as_deref()
-                    .unwrap_or_else(|| hit.source_path.as_str()),
+                    .unwrap_or(hit.source_path.as_str()),
                 hit.score,
                 hit.output_path
             );
         }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConvertResult {
+    source_path: String,
+    output_path: String,
+    source_modified: Option<String>,
+    title: Option<String>,
+    converted_at: String,
+    markdown: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConvertedDocument {
+    title: Option<String>,
+    text_content: String,
+}
+
+#[cfg(test)]
+fn convert_single_file(
+    markitdown: &MarkItDown,
+    input: &Path,
+    conversion_opts: Option<ConversionOptions>,
+) -> Result<ConvertedDocument> {
+    let path_str = input
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid path encoding for {}", input.display()))?;
+
+    if let Some(converted) = markitdown.convert(path_str, conversion_opts) {
+        return Ok(ConvertedDocument {
+            title: converted.title,
+            text_content: converted.text_content,
+        });
+    }
+
+    let text = fs::read_to_string(input).with_context(|| {
+        format!(
+            "no converter available for {}, and file could not be read as UTF-8 text",
+            input.display()
+        )
+    })?;
+
+    Ok(ConvertedDocument {
+        title: None,
+        text_content: text,
+    })
+}
+
+fn render_frontmatter_markdown(frontmatter: &Frontmatter, text_content: &str) -> Result<String> {
+    let yaml = serde_yaml::to_string(frontmatter).context("serializing frontmatter")?;
+    let mut body = String::new();
+    body.push_str("---\n");
+    body.push_str(&yaml);
+    body.push_str("---\n\n");
+    body.push_str(text_content);
+    Ok(body)
+}
+
+/// Statistics for batch conversion
+#[derive(Debug, Clone, Default, Serialize)]
+struct ConvertStats {
+    total: usize,
+    converted: usize,
+    skipped: usize,
+    failed: usize,
+    errors: Vec<String>,
+}
+
+/// Processor that handles document conversion with fallback chains
+struct DocumentProcessor {
+    markitdown: MarkItDown,
+    settings: ServiceSettings,
+    vlm_enabled: bool,
+    vlm_prompt: Option<String>,
+    ocr_enabled: bool,
+    ocr_backend: OcrBackend,
+    ocr_languages: Vec<String>,
+}
+
+impl DocumentProcessor {
+    fn new(settings: ServiceSettings) -> Self {
+        ConversionService::configure_llm_env(&settings);
+        Self {
+            markitdown: MarkItDown::new(),
+            settings,
+            vlm_enabled: false,
+            vlm_prompt: None,
+            ocr_enabled: false,
+            ocr_backend: OcrBackend::Tesseract,
+            ocr_languages: vec!["eng".to_string()],
+        }
+    }
+
+    fn with_vlm(mut self, enabled: bool, prompt: Option<String>) -> Self {
+        self.vlm_enabled = enabled || self.settings.processors.vlm.enabled;
+        self.vlm_prompt = prompt;
+        self
+    }
+
+    fn with_ocr(mut self, enabled: bool, backend: OcrBackend, languages: Option<Vec<String>>) -> Self {
+        self.ocr_enabled = enabled || self.settings.processors.ocr.enabled;
+        if enabled {
+            self.ocr_backend = backend;
+        } else {
+            self.ocr_backend = self.settings.processors.ocr.backend;
+        }
+        self.ocr_languages = languages.unwrap_or_else(|| self.settings.processors.ocr.languages.clone());
+        self
+    }
+
+    fn process(&self, input: &Path) -> Result<ConvertedDocument> {
+        let extension = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        // Check if this is an image and VLM is enabled
+        if self.vlm_enabled && is_image_extension(&extension) {
+            return self.process_with_vlm(input, &extension);
+        }
+
+        // Try markitdown first
+        let conversion_opts = self.build_conversion_options();
+        match self.markitdown.convert(
+            input.to_str().ok_or_else(|| anyhow!("invalid path encoding"))?,
+            conversion_opts,
+        ) {
+            Some(result) if !result.text_content.trim().is_empty() => {
+                return Ok(ConvertedDocument {
+                    title: result.title,
+                    text_content: result.text_content,
+                });
+            }
+            _ => {}
+        }
+
+        // If OCR is enabled and we got empty content, try OCR
+        if self.ocr_enabled
+            && (is_pdf_extension(&extension) || is_image_extension(&extension))
+            && let Ok(ocr_result) = self.process_with_ocr(input)
+            && !ocr_result.text_content.trim().is_empty()
+        {
+            return Ok(ocr_result);
+        }
+
+        // Fallback: try reading as text
+        let text = fs::read_to_string(input).with_context(|| {
+            format!(
+                "no converter available for {}, and file could not be read as UTF-8 text",
+                input.display()
+            )
+        })?;
+
+        Ok(ConvertedDocument {
+            title: None,
+            text_content: text,
+        })
+    }
+
+    fn build_conversion_options(&self) -> Option<ConversionOptions> {
+        if self.settings.llm_enabled {
+            Some(ConversionOptions {
+                file_extension: None,
+                url: None,
+                llm_client: Some(self.settings.llm_client.clone()),
+                llm_model: Some(self.settings.llm_model.clone()),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn process_with_vlm(&self, input: &Path, _extension: &str) -> Result<ConvertedDocument> {
+        let vlm_config = &self.settings.processors.vlm;
+        let prompt = self.vlm_prompt.as_ref()
+            .or(vlm_config.prompts.get("default"))
+            .map(|s| s.as_str())
+            .unwrap_or("Describe this image in detail.");
+
+        // Read and encode image as base64
+        let image_data = fs::read(input)
+            .with_context(|| format!("reading image file {}", input.display()))?;
+        let base64_image = base64_encode(&image_data);
+
+        // Determine MIME type
+        let extension = input.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png");
+        let mime_type = match extension.to_lowercase().as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+
+        // Call EAVS for VLM processing
+        let description = call_eavs_vlm(
+            &vlm_config.eavs_url,
+            &vlm_config.provider,
+            &vlm_config.model,
+            &base64_image,
+            mime_type,
+            prompt,
+        )?;
+
+        let title = input.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        Ok(ConvertedDocument {
+            title,
+            text_content: format!("# Image: {}\n\n{}", 
+                input.file_name().and_then(|s| s.to_str()).unwrap_or("image"),
+                description
+            ),
+        })
+    }
+
+    fn process_with_ocr(&self, input: &Path) -> Result<ConvertedDocument> {
+        let text = run_ocr(input, self.ocr_backend, &self.ocr_languages)?;
+        
+        let title = input.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        Ok(ConvertedDocument {
+            title,
+            text_content: text,
+        })
+    }
+}
+
+fn is_image_extension(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif")
+}
+
+fn is_pdf_extension(ext: &str) -> bool {
+    ext == "pdf"
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+        
+        if chunk.len() > 2 {
+            result.push(ALPHABET[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    
+    result
+}
+
+/// Call EAVS server for VLM processing
+fn call_eavs_vlm(
+    eavs_url: &str,
+    provider: &str,
+    model: &str,
+    base64_image: &str,
+    mime_type: &str,
+    prompt: &str,
+) -> Result<String> {
+    let client = reqwest::blocking::Client::new();
+    
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prompt
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", mime_type, base64_image)
+                    }
+                }
+            ]
+        }],
+        "max_tokens": 4096
+    });
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", eavs_url))
+        .header("Content-Type", "application/json")
+        .header("X-Provider", provider)
+        .json(&request_body)
+        .send()
+        .context("sending request to EAVS")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        bail!("EAVS request failed with status {}: {}", status, body);
+    }
+
+    let response_json: serde_json::Value = response.json()
+        .context("parsing EAVS response")?;
+
+    response_json["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("invalid response format from EAVS"))
+}
+
+/// Run OCR on a file
+fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -> Result<String> {
+    let lang_arg = languages.join("+");
+    
+    match backend {
+        OcrBackend::Tesseract => {
+            let output = ProcCommand::new("tesseract")
+                .arg(input)
+                .arg("stdout")
+                .arg("-l")
+                .arg(&lang_arg)
+                .output()
+                .context("running tesseract OCR")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("tesseract failed: {}", stderr);
+            }
+
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        OcrBackend::Surya => {
+            // Surya uses Python, call via python
+            let output = ProcCommand::new("surya_ocr")
+                .arg(input)
+                .arg("--langs")
+                .arg(&lang_arg)
+                .output()
+                .context("running surya OCR")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("surya failed: {}", stderr);
+            }
+
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        OcrBackend::Easyocr => {
+            // EasyOCR via Python command
+            let script = format!(
+                r#"import easyocr; import sys; reader = easyocr.Reader(['{}']); result = reader.readtext('{}'); print('\n'.join([text for _, text, _ in result]))"#,
+                lang_arg.replace("+", "','"),
+                input.display()
+            );
+            
+            let output = ProcCommand::new("python3")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .context("running easyocr")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("easyocr failed: {}", stderr);
+            }
+
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+    }
+}
+
+fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
+    let mut settings = ctx.service_settings(&ServiceRunOpts {
+        watch_dir: None,
+        output_dir: None,
+        index_dir: None,
+        disable_index: true,
+        once: true,
+    })?;
+    settings.index_enabled = false;
+
+    // Check if reading from stdin
+    let is_stdin = cmd.input.is_none() 
+        || cmd.input.as_ref().map(|p| p.as_os_str() == "-").unwrap_or(false);
+
+    if is_stdin {
+        return handle_convert_stdin(ctx, &cmd, &settings);
+    }
+
+    let input = expand_path(cmd.input.clone().unwrap())?;
+
+    // Check if input is a directory
+    if input.is_dir() {
+        return handle_convert_directory(ctx, &cmd, &settings, &input);
+    }
+
+    // Single file conversion
+    if !input.is_file() {
+        bail!("input path is not a file or directory: {}", input.display());
+    }
+
+    let processor = DocumentProcessor::new(settings)
+        .with_vlm(cmd.vlm, cmd.vlm_prompt.clone())
+        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
+
+    let converted = processor.process(&input)?;
+
+    let output = cmd
+        .output
+        .map(expand_path)
+        .transpose()
+        .context("expanding output path")?;
+
+    let output_path_str = output
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let converted_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let source_modified = fs::metadata(&input)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(system_time_to_rfc3339);
+
+    let frontmatter = Frontmatter {
+        source_path: input.display().to_string(),
+        output_path: output_path_str.clone(),
+        source_modified: source_modified.clone(),
+        title: converted.title.clone(),
+        converted_at: converted_at.clone(),
+    };
+
+    let markdown = render_frontmatter_markdown(&frontmatter, &converted.text_content)?;
+
+    output_convert_result(ctx, output, &ConvertResult {
+        source_path: input.display().to_string(),
+        output_path: output_path_str,
+        source_modified,
+        title: converted.title,
+        converted_at,
+        markdown,
+    })
+}
+
+fn handle_convert_stdin(
+    ctx: &RuntimeContext,
+    cmd: &ConvertCommand,
+    settings: &ServiceSettings,
+) -> Result<()> {
+    let mut content = Vec::new();
+    io::stdin().read_to_end(&mut content)
+        .context("reading from stdin")?;
+
+    // Determine file extension from format hint
+    let extension = cmd.from.unwrap_or(InputFormat::Auto).extension();
+    
+    // Create a temporary file with the appropriate extension
+    let temp_dir = std::env::temp_dir();
+    let temp_file = if let Some(ext) = extension {
+        temp_dir.join(format!("ingestr-stdin.{}", ext))
+    } else {
+        // Try to auto-detect format from content
+        let detected_ext = detect_format_from_content(&content);
+        temp_dir.join(format!("ingestr-stdin.{}", detected_ext))
+    };
+
+    fs::write(&temp_file, &content)
+        .context("writing stdin content to temp file")?;
+
+    let processor = DocumentProcessor::new(settings.clone())
+        .with_vlm(cmd.vlm, cmd.vlm_prompt.clone())
+        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
+
+    let converted = processor.process(&temp_file);
+    
+    // Clean up temp file
+    let _ = fs::remove_file(&temp_file);
+
+    let converted = converted?;
+
+    let output = cmd
+        .output
+        .as_ref()
+        .map(|p| expand_path(p.clone()))
+        .transpose()
+        .context("expanding output path")?;
+
+    let output_path_str = output
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let converted_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let frontmatter = Frontmatter {
+        source_path: "stdin".to_string(),
+        output_path: output_path_str.clone(),
+        source_modified: None,
+        title: converted.title.clone(),
+        converted_at: converted_at.clone(),
+    };
+
+    let markdown = render_frontmatter_markdown(&frontmatter, &converted.text_content)?;
+
+    output_convert_result(ctx, output, &ConvertResult {
+        source_path: "stdin".to_string(),
+        output_path: output_path_str,
+        source_modified: None,
+        title: converted.title,
+        converted_at,
+        markdown,
+    })
+}
+
+fn detect_format_from_content(content: &[u8]) -> &'static str {
+    // Check for common file signatures
+    if content.starts_with(b"%PDF") {
+        return "pdf";
+    }
+    if content.starts_with(b"PK\x03\x04") {
+        // Could be docx, xlsx, pptx - default to docx
+        return "docx";
+    }
+    if content.starts_with(b"<!DOCTYPE html") || content.starts_with(b"<html") || content.starts_with(b"<HTML") {
+        return "html";
+    }
+    if content.starts_with(b"<?xml") {
+        return "xml";
+    }
+    if content.starts_with(b"{") || content.starts_with(b"[") {
+        return "json";
+    }
+    
+    // Default to text
+    "txt"
+}
+
+fn handle_convert_directory(
+    ctx: &RuntimeContext,
+    cmd: &ConvertCommand,
+    settings: &ServiceSettings,
+    input_dir: &Path,
+) -> Result<()> {
+    let output_dir = cmd.output
+        .as_ref()
+        .map(|p| expand_path(p.clone()))
+        .transpose()
+        .context("expanding output path")?;
+
+    // Collect files to process
+    let walker = if cmd.recursive {
+        WalkDir::new(input_dir)
+    } else {
+        WalkDir::new(input_dir).max_depth(1)
+    };
+
+    let extensions: Option<Vec<String>> = cmd.extensions.clone()
+        .map(|exts| exts.iter().map(|e| e.to_lowercase()).collect());
+
+    let files: Vec<PathBuf> = walker
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            if let Some(ref exts) = extensions {
+                e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| exts.contains(&ext.to_lowercase()))
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .filter(|e| {
+            // Skip hidden files if skip_hidden is set
+            if settings.skip_hidden {
+                !e.path()
+                    .components()
+                    .any(|c| c.as_os_str().to_str().map(|s| s.starts_with('.')).unwrap_or(false))
+            } else {
+                true
+            }
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    if files.is_empty() {
+        info!("no files found to convert");
+        return Ok(());
+    }
+
+    let total = files.len();
+    info!("found {} files to convert", total);
+
+    if ctx.common.dry_run {
+        for file in &files {
+            let relative = file.strip_prefix(input_dir).unwrap_or(file);
+            let output_path = if let Some(ref out_dir) = output_dir {
+                let mut out = out_dir.join(relative);
+                out.set_extension("md");
+                out.display().to_string()
+            } else {
+                "-".to_string()
+            };
+            println!("Would convert {} -> {}", file.display(), output_path);
+        }
+        return Ok(());
+    }
+
+    // Use parallel processing if requested
+    let parallel = ctx.common.parallel.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
+
+    let converted = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    let results: Vec<Result<ConvertResult>> = if parallel > 1 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(parallel)
+            .build()
+            .context("building thread pool")?
+            .install(|| {
+                files.par_iter().map(|file| {
+                    process_file_for_batch(
+                        file,
+                        input_dir,
+                        output_dir.as_ref(),
+                        settings,
+                        cmd,
+                        &converted,
+                        &failed,
+                        &errors,
+                    )
+                }).collect()
+            })
+    } else {
+        files.iter().map(|file| {
+            process_file_for_batch(
+                file,
+                input_dir,
+                output_dir.as_ref(),
+                settings,
+                cmd,
+                &converted,
+                &failed,
+                &errors,
+            )
+        }).collect()
+    };
+
+    let stats = ConvertStats {
+        total,
+        converted: converted.load(Ordering::Relaxed),
+        skipped: 0,
+        failed: failed.load(Ordering::Relaxed),
+        errors: errors.into_inner().unwrap_or_default(),
+    };
+
+    // Output results
+    if ctx.common.json {
+        let successful_results: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
+        let output = serde_json::json!({
+            "stats": stats,
+            "results": successful_results,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if ctx.common.yaml {
+        let successful_results: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
+        let output = serde_json::json!({
+            "stats": stats,
+            "results": successful_results,
+        });
+        println!("{}", serde_yaml::to_string(&output)?);
+    } else {
+        println!("\nConversion complete:");
+        println!("  Total files: {}", stats.total);
+        println!("  Converted:   {}", stats.converted);
+        println!("  Failed:      {}", stats.failed);
+        if !stats.errors.is_empty() {
+            println!("\nErrors:");
+            for err in &stats.errors {
+                println!("  - {}", err);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_file_for_batch(
+    file: &Path,
+    input_dir: &Path,
+    output_dir: Option<&PathBuf>,
+    settings: &ServiceSettings,
+    cmd: &ConvertCommand,
+    converted: &AtomicUsize,
+    failed: &AtomicUsize,
+    errors: &std::sync::Mutex<Vec<String>>,
+) -> Result<ConvertResult> {
+    let processor = DocumentProcessor::new(settings.clone())
+        .with_vlm(cmd.vlm, cmd.vlm_prompt.clone())
+        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
+
+    match processor.process(file) {
+        Ok(doc) => {
+            let relative = file.strip_prefix(input_dir).unwrap_or(file);
+            let output_path = if let Some(out_dir) = output_dir {
+                let mut out = out_dir.join(relative);
+                out.set_extension("md");
+                out
+            } else {
+                PathBuf::from("-")
+            };
+
+            let converted_at = OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            let source_modified = fs::metadata(file)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(system_time_to_rfc3339);
+
+            let frontmatter = Frontmatter {
+                source_path: file.display().to_string(),
+                output_path: output_path.display().to_string(),
+                source_modified: source_modified.clone(),
+                title: doc.title.clone(),
+                converted_at: converted_at.clone(),
+            };
+
+            let markdown = render_frontmatter_markdown(&frontmatter, &doc.text_content)?;
+
+            // Write output file if output_dir is specified
+            if output_dir.is_some() {
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&output_path, &markdown)?;
+            }
+
+            converted.fetch_add(1, Ordering::Relaxed);
+            info!("converted {} -> {}", file.display(), output_path.display());
+
+            Ok(ConvertResult {
+                source_path: file.display().to_string(),
+                output_path: output_path.display().to_string(),
+                source_modified,
+                title: doc.title,
+                converted_at,
+                markdown,
+            })
+        }
+        Err(e) => {
+            failed.fetch_add(1, Ordering::Relaxed);
+            let err_msg = format!("{}: {}", file.display(), e);
+            errors.lock().unwrap().push(err_msg.clone());
+            error!("failed to convert {}: {}", file.display(), e);
+            Err(e)
+        }
+    }
+}
+
+fn output_convert_result(
+    ctx: &RuntimeContext,
+    output: Option<PathBuf>,
+    result: &ConvertResult,
+) -> Result<()> {
+    if let Some(output) = output {
+        if ctx.common.dry_run {
+            info!("dry-run: would write markdown to {}", output.display());
+        } else {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating output directory {}", parent.display()))?;
+            }
+            fs::write(&output, &result.markdown)
+                .with_context(|| format!("writing markdown to {}", output.display()))?;
+            if !ctx.common.quiet {
+                println!("Converted {} -> {}", result.source_path, output.display());
+            }
+        }
+    } else if ctx.common.json {
+        println!("{}", serde_json::to_string_pretty(result)?);
+    } else if ctx.common.yaml {
+        println!("{}", serde_yaml::to_string(result)?);
+    } else {
+        print!("{}", result.markdown);
+    }
     Ok(())
 }
 
@@ -1031,6 +2031,7 @@ struct ServiceSettings {
     llm_model: String,
     llm_base_url: Option<String>,
     llm_api_key: Option<String>,
+    processors: ProcessorsConfig,
 }
 
 impl ResolvedDirectories {
@@ -1174,7 +2175,7 @@ impl ConversionService {
     }
 
     fn handle_event(&mut self, event: Event) -> Result<()> {
-        let kind = event.kind.clone();
+        let kind = event.kind;
         for path in event.paths {
             if !path.is_file() {
                 continue;
@@ -1426,13 +2427,13 @@ fn system_time_to_rfc3339(time: SystemTime) -> Option<String> {
 }
 
 fn parse_frontmatter(body: &str) -> (Option<Frontmatter>, &str) {
-    if let Some(rest) = body.strip_prefix("---\n") {
-        if let Some(idx) = rest.find("\n---\n") {
-            let (front, content) = rest.split_at(idx);
-            let content = &content["\n---\n".len()..];
-            if let Ok(parsed) = serde_yaml::from_str::<Frontmatter>(front) {
-                return (Some(parsed), content);
-            }
+    if let Some(rest) = body.strip_prefix("---\n")
+        && let Some(idx) = rest.find("\n---\n")
+    {
+        let (front, content) = rest.split_at(idx);
+        let content = &content["\n---\n".len()..];
+        if let Ok(parsed) = serde_yaml::from_str::<Frontmatter>(front) {
+            return (Some(parsed), content);
         }
     }
     (None, body)
@@ -1459,5 +2460,387 @@ impl fmt::Display for AppPaths {
             self.data_dir.display(),
             self.state_dir.display()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time since epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ingestr-test-{nanos}"))
+    }
+
+    fn create_test_settings() -> ServiceSettings {
+        ServiceSettings {
+            watch_dir: PathBuf::from("/tmp"),
+            output_dir: PathBuf::from("/tmp/output"),
+            index_dir: PathBuf::from("/tmp/index"),
+            index_enabled: false,
+            debounce: Duration::from_millis(50),
+            skip_hidden: true,
+            data_dir: PathBuf::from("/tmp/data"),
+            state_dir: PathBuf::from("/tmp/state"),
+            llm_enabled: false,
+            llm_client: "openai".to_string(),
+            llm_model: "gpt-4o".to_string(),
+            llm_base_url: None,
+            llm_api_key: None,
+            processors: ProcessorsConfig::default(),
+        }
+    }
+
+    #[test]
+    fn convert_single_file_renders_frontmatter_and_content() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("sample.txt");
+        fs::write(&input, "Hello world")?;
+
+        let markitdown = MarkItDown::new();
+        let converted = convert_single_file(&markitdown, &input, None)?;
+
+        let frontmatter = Frontmatter {
+            source_path: input.display().to_string(),
+            output_path: "-".to_string(),
+            source_modified: None,
+            title: converted.title.clone(),
+            converted_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+
+        let markdown = render_frontmatter_markdown(&frontmatter, &converted.text_content)?;
+        let (parsed, body) = parse_frontmatter(&markdown);
+
+        let parsed = parsed.expect("frontmatter parsed");
+        assert_eq!(parsed.source_path, input.display().to_string());
+        assert_eq!(parsed.output_path, "-");
+        assert!(body.contains("Hello world"));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn document_processor_converts_text_file() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("test.txt");
+        fs::write(&input, "Test content for processor")?;
+
+        let settings = create_test_settings();
+        let processor = DocumentProcessor::new(settings);
+        let result = processor.process(&input)?;
+
+        assert!(result.text_content.contains("Test content for processor"));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn document_processor_with_vlm_disabled_skips_vlm() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("test.txt");
+        fs::write(&input, "Plain text")?;
+
+        let settings = create_test_settings();
+        let processor = DocumentProcessor::new(settings)
+            .with_vlm(false, None);
+        
+        assert!(!processor.vlm_enabled);
+        
+        let result = processor.process(&input)?;
+        assert!(result.text_content.contains("Plain text"));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn document_processor_with_ocr_disabled_skips_ocr() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("test.txt");
+        fs::write(&input, "Plain text")?;
+
+        let settings = create_test_settings();
+        let processor = DocumentProcessor::new(settings)
+            .with_ocr(false, OcrBackend::Tesseract, None);
+        
+        assert!(!processor.ocr_enabled);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn detect_format_from_content_identifies_pdf() {
+        let content = b"%PDF-1.4 rest of content";
+        assert_eq!(detect_format_from_content(content), "pdf");
+    }
+
+    #[test]
+    fn detect_format_from_content_identifies_html() {
+        let content = b"<!DOCTYPE html><html>test</html>";
+        assert_eq!(detect_format_from_content(content), "html");
+        
+        let content2 = b"<html><body>test</body></html>";
+        assert_eq!(detect_format_from_content(content2), "html");
+    }
+
+    #[test]
+    fn detect_format_from_content_identifies_docx() {
+        let content = b"PK\x03\x04rest";
+        assert_eq!(detect_format_from_content(content), "docx");
+    }
+
+    #[test]
+    fn detect_format_from_content_identifies_json() {
+        let content = b"{\"key\": \"value\"}";
+        assert_eq!(detect_format_from_content(content), "json");
+        
+        let content2 = b"[1, 2, 3]";
+        assert_eq!(detect_format_from_content(content2), "json");
+    }
+
+    #[test]
+    fn detect_format_from_content_identifies_xml() {
+        let content = b"<?xml version=\"1.0\"?><root></root>";
+        assert_eq!(detect_format_from_content(content), "xml");
+    }
+
+    #[test]
+    fn detect_format_from_content_defaults_to_txt() {
+        let content = b"Just some plain text";
+        assert_eq!(detect_format_from_content(content), "txt");
+    }
+
+    #[test]
+    fn is_image_extension_works() {
+        assert!(is_image_extension("jpg"));
+        assert!(is_image_extension("jpeg"));
+        assert!(is_image_extension("png"));
+        assert!(is_image_extension("gif"));
+        assert!(is_image_extension("webp"));
+        assert!(!is_image_extension("pdf"));
+        assert!(!is_image_extension("txt"));
+        assert!(!is_image_extension("docx"));
+    }
+
+    #[test]
+    fn is_pdf_extension_works() {
+        assert!(is_pdf_extension("pdf"));
+        assert!(!is_pdf_extension("txt"));
+        assert!(!is_pdf_extension("docx"));
+    }
+
+    #[test]
+    fn base64_encode_works() {
+        let data = b"Hello, World!";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "SGVsbG8sIFdvcmxkIQ==");
+    }
+
+    #[test]
+    fn base64_encode_empty() {
+        let data = b"";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "");
+    }
+
+    #[test]
+    fn base64_encode_single_byte() {
+        let data = b"A";
+        let encoded = base64_encode(data);
+        assert_eq!(encoded, "QQ==");
+    }
+
+    #[test]
+    fn input_format_extension() {
+        assert_eq!(InputFormat::Html.extension(), Some("html"));
+        assert_eq!(InputFormat::Pdf.extension(), Some("pdf"));
+        assert_eq!(InputFormat::Docx.extension(), Some("docx"));
+        assert_eq!(InputFormat::Auto.extension(), None);
+    }
+
+    #[test]
+    fn ocr_backend_display() {
+        assert_eq!(OcrBackend::Tesseract.to_string(), "tesseract");
+        assert_eq!(OcrBackend::Surya.to_string(), "surya");
+        assert_eq!(OcrBackend::Easyocr.to_string(), "easyocr");
+    }
+
+    #[test]
+    fn processors_config_default() {
+        let config = ProcessorsConfig::default();
+        assert_eq!(config.pipeline, vec!["markitdown"]);
+        assert!(config.routing.is_empty());
+        assert!(!config.vlm.enabled);
+        assert!(!config.ocr.enabled);
+    }
+
+    #[test]
+    fn vlm_config_default_prompts() {
+        let config = VlmConfig::default();
+        assert!(config.prompts.contains_key("default"));
+        assert!(config.prompts.contains_key("diagram"));
+        assert!(config.prompts.contains_key("screenshot"));
+    }
+
+    #[test]
+    fn ocr_config_default() {
+        let config = OcrConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.backend, OcrBackend::Tesseract);
+        assert_eq!(config.languages, vec!["eng"]);
+    }
+
+    #[test]
+    fn convert_stats_default() {
+        let stats = ConvertStats::default();
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.converted, 0);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.failed, 0);
+        assert!(stats.errors.is_empty());
+    }
+
+    #[test]
+    fn batch_convert_collects_files_by_extension() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        
+        // Create test files
+        fs::write(dir.join("doc1.txt"), "text 1")?;
+        fs::write(dir.join("doc2.txt"), "text 2")?;
+        fs::write(dir.join("doc3.pdf"), "pdf content")?;
+        fs::write(dir.join("doc4.html"), "<html>test</html>")?;
+
+        let extensions = Some(vec!["txt".to_string()]);
+        let files: Vec<PathBuf> = WalkDir::new(&dir)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                if let Some(ref exts) = extensions {
+                    e.path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| exts.contains(&ext.to_lowercase()))
+                        .unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.extension().map(|e| e == "txt").unwrap_or(false)));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_convert_skips_hidden_files() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        
+        // Create test files
+        fs::write(dir.join("visible.txt"), "visible")?;
+        fs::write(dir.join(".hidden.txt"), "hidden")?;
+
+        let skip_hidden = true;
+        let files: Vec<PathBuf> = WalkDir::new(&dir)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                if skip_hidden {
+                    !e.path()
+                        .components()
+                        .any(|c| c.as_os_str().to_str().map(|s| s.starts_with('.')).unwrap_or(false))
+                } else {
+                    true
+                }
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].file_name().map(|n| n == "visible.txt").unwrap_or(false));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn frontmatter_serialization_roundtrip() -> Result<()> {
+        let frontmatter = Frontmatter {
+            source_path: "/test/input.txt".to_string(),
+            output_path: "/test/output.md".to_string(),
+            source_modified: Some("2025-01-01T00:00:00Z".to_string()),
+            title: Some("Test Title".to_string()),
+            converted_at: "2025-01-01T00:00:01Z".to_string(),
+        };
+
+        let content = "Test content here.";
+        let markdown = render_frontmatter_markdown(&frontmatter, content)?;
+        let (parsed, body) = parse_frontmatter(&markdown);
+
+        let parsed = parsed.expect("frontmatter should parse");
+        assert_eq!(parsed.source_path, frontmatter.source_path);
+        assert_eq!(parsed.output_path, frontmatter.output_path);
+        assert_eq!(parsed.title, frontmatter.title);
+        assert!(body.contains(content));
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_missing() {
+        let content = "No frontmatter here";
+        let (fm, body) = parse_frontmatter(content);
+        assert!(fm.is_none());
+        assert_eq!(body, content);
+    }
+
+    #[test]
+    fn parse_frontmatter_handles_malformed() {
+        let content = "---\ninvalid: yaml: here\n---\nBody content";
+        let (fm, _body) = parse_frontmatter(content);
+        // Should return None for malformed YAML
+        assert!(fm.is_none());
+    }
+
+    #[test]
+    fn convert_result_json_serialization() -> Result<()> {
+        let result = ConvertResult {
+            source_path: "/test.txt".to_string(),
+            output_path: "/test.md".to_string(),
+            source_modified: Some("2025-01-01T00:00:00Z".to_string()),
+            title: Some("Title".to_string()),
+            converted_at: "2025-01-01T00:00:01Z".to_string(),
+            markdown: "# Title\n\nContent".to_string(),
+        };
+
+        let json = serde_json::to_string(&result)?;
+        assert!(json.contains("source_path"));
+        assert!(json.contains("output_path"));
+        assert!(json.contains("markdown"));
+
+        let parsed: ConvertResult = serde_json::from_str(&json)?;
+        assert_eq!(parsed.source_path, result.source_path);
+
+        Ok(())
     }
 }
