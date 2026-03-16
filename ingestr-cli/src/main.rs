@@ -22,7 +22,9 @@ use log::{LevelFilter, debug, error, info, warn};
 use markitdown::{MarkItDown, model::ConversionOptions};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sysinfo::{Pid, Signal, System};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -38,8 +40,32 @@ fn main() {
     }
 }
 
+/// Known subcommand names (used for default-subcommand detection).
+const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "service", "search", "convert", "init", "config", "cache", "completions", "help",
+];
+
 fn try_main() -> Result<()> {
-    let cli = Cli::parse();
+    // Default subcommand: if the first positional arg is not a known subcommand,
+    // treat it as `convert <INPUT>`. This lets users write `ingestr file.pdf`
+    // instead of `ingestr convert file.pdf`.
+    let args: Vec<String> = env::args().collect();
+    let cli = if args.len() > 1 {
+        let first_arg = &args[1];
+        // Skip if it's a flag (starts with -)
+        let is_flag = first_arg.starts_with('-');
+        let is_subcommand = KNOWN_SUBCOMMANDS.contains(&first_arg.as_str());
+        if !is_flag && !is_subcommand {
+            // Insert "convert" as the subcommand
+            let mut new_args = vec![args[0].clone(), "convert".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            Cli::parse_from(new_args)
+        } else {
+            Cli::parse()
+        }
+    } else {
+        Cli::parse()
+    };
 
     let mut ctx = RuntimeContext::new(cli.common.clone())?;
     ctx.init_logging()?;
@@ -51,6 +77,7 @@ fn try_main() -> Result<()> {
         Command::Convert(cmd) => handle_convert(&ctx, cmd),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
+        Command::Cache { command } => handle_cache(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
     }
 }
@@ -102,7 +129,7 @@ struct CommonOpts {
     #[arg(long = "dry-run", global = true)]
     dry_run: bool,
     /// Assume "yes" for interactive prompts
-    #[arg(short = 'y', long = "yes", alias = "force", global = true)]
+    #[arg(short = 'y', long = "yes", global = true)]
     assume_yes: bool,
     /// Maximum seconds to allow an operation to run
     #[arg(long = "timeout", value_name = "SECONDS", global = true)]
@@ -143,11 +170,24 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Manage the conversion cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Generate shell completions
     Completions {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Clear the conversion cache
+    Clear,
+    /// Show cache statistics
+    Stats,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -197,9 +237,9 @@ struct SearchCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ConvertCommand {
-    /// File or directory to convert (use '-' or omit for stdin)
+    /// File, directory, or URL to convert (use '-' or omit for stdin)
     #[arg(value_name = "INPUT")]
-    input: Option<PathBuf>,
+    input: Option<String>,
     /// Write output to a file or directory instead of stdout
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
@@ -215,9 +255,15 @@ struct ConvertCommand {
     /// Enable VLM processing for images
     #[arg(long)]
     vlm: bool,
+    /// Vision model to use (e.g., "glm-4.6v-flash", "qwen/qwen3-vl-8b")
+    #[arg(long, value_name = "MODEL")]
+    vlm_model: Option<String>,
     /// Custom VLM prompt for image description
     #[arg(long, value_name = "PROMPT")]
     vlm_prompt: Option<String>,
+    /// Number of parallel VLM requests (default: 1)
+    #[arg(short = 'j', long = "jobs", value_name = "N", default_value = "1")]
+    jobs: usize,
     /// Enable OCR processing for scanned documents
     #[arg(long)]
     ocr: bool,
@@ -227,6 +273,36 @@ struct ConvertCommand {
     /// OCR languages (comma-separated, e.g., "eng,deu")
     #[arg(long, value_name = "LANGS", value_delimiter = ',')]
     ocr_languages: Option<Vec<String>>,
+    /// Include YAML frontmatter with metadata in output
+    #[arg(long)]
+    meta: bool,
+    /// Skip post-processing cleanup (output raw conversion result)
+    #[arg(long)]
+    raw: bool,
+    /// Maximum tokens to output (approximate, truncates at section boundaries)
+    #[arg(long, value_name = "N")]
+    max_tokens: Option<usize>,
+    /// Maximum characters to output (truncates at section boundaries)
+    #[arg(long, value_name = "N")]
+    max_chars: Option<usize>,
+    /// Character offset to start from (for pagination with --max-tokens/--max-chars)
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    offset: usize,
+    /// Show document structure (table of contents with token estimates)
+    #[arg(long)]
+    toc: bool,
+    /// Extract only a specific section by number or heading (e.g., "2.1" or "Summary")
+    #[arg(short = 's', long, value_name = "SECTION")]
+    section: Option<String>,
+    /// Convert only specific pages (PDF only, e.g., "1-3,7")
+    #[arg(long, value_name = "PAGES")]
+    pages: Option<String>,
+    /// Read input from the system clipboard
+    #[arg(long)]
+    clipboard: bool,
+    /// Bypass the conversion cache
+    #[arg(long)]
+    no_cache: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -695,18 +771,19 @@ impl Default for ProcessorsConfig {
     }
 }
 
-/// VLM (Vision Language Model) processor configuration
+/// VLM (Vision Language Model) processor configuration.
+/// When `llm_url` or `model` are left empty/default, the main `[llm]` config
+/// is used as fallback so users only need to configure their LLM once.
+/// Works with any OpenAI-compatible vision API (Ollama, LM Studio, vLLM, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct VlmConfig {
     /// Enable VLM processing
     enabled: bool,
-    /// EAVS server URL
-    eavs_url: String,
-    /// Provider to use (ollama, openai, anthropic)
-    provider: String,
-    /// Model name
-    model: String,
+    /// LLM server URL (falls back to [llm].base_url if empty)
+    llm_url: Option<String>,
+    /// Model name (falls back to [llm].model if empty)
+    model: Option<String>,
     /// Custom prompts per file type
     prompts: HashMap<String, String>,
 }
@@ -729,9 +806,8 @@ impl Default for VlmConfig {
 
         Self {
             enabled: false,
-            eavs_url: "http://localhost:3000".to_string(),
-            provider: "ollama".to_string(),
-            model: "llava".to_string(),
+            llm_url: None,
+            model: None,
             prompts,
         }
     }
@@ -986,6 +1062,8 @@ struct ConvertResult {
 struct ConvertedDocument {
     title: Option<String>,
     text_content: String,
+    /// If true, content was already streamed to a file during VLM processing
+    already_written: bool,
 }
 
 #[cfg(test)]
@@ -1002,6 +1080,7 @@ fn convert_single_file(
         return Ok(ConvertedDocument {
             title: converted.title,
             text_content: converted.text_content,
+            already_written: false,
         });
     }
 
@@ -1015,6 +1094,7 @@ fn convert_single_file(
     Ok(ConvertedDocument {
         title: None,
         text_content: text,
+        already_written: false,
     })
 }
 
@@ -1026,6 +1106,592 @@ fn render_frontmatter_markdown(frontmatter: &Frontmatter, text_content: &str) ->
     body.push_str("---\n\n");
     body.push_str(text_content);
     Ok(body)
+}
+
+// ============================================================
+// Post-processing: clean noisy conversion output
+// ============================================================
+
+/// Estimate token count (rough: ~4 chars per token for English text)
+fn estimate_tokens(text: &str) -> usize {
+    // A simple heuristic: split on whitespace, count words,
+    // then apply ~1.3 tokens per word (common for English).
+    // For non-English or code-heavy content, chars/4 is more stable.
+    (text.len() + 3) / 4
+}
+
+/// Clean converted markdown by removing common PDF/document noise.
+fn clean_markdown(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+
+    // 1. Detect and remove repeated headers/footers.
+    // If the same line appears on 3+ "pages" (roughly every 40-80 lines), it is likely a header/footer.
+    if lines.len() > 80 {
+        let mut freq: HashMap<String, usize> = HashMap::new();
+        for line in &lines {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && trimmed.len() < 120 {
+                *freq.entry(trimmed.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+        let threshold = (lines.len() / 60).max(3);
+        let repeated: std::collections::HashSet<String> = freq
+            .into_iter()
+            .filter(|(_, count)| *count >= threshold)
+            .map(|(line, _)| line)
+            .collect();
+
+        if !repeated.is_empty() {
+            lines.retain(|line| {
+                let trimmed = line.trim().to_lowercase();
+                !repeated.contains(&trimmed)
+            });
+        }
+    }
+
+    // 2. Remove standalone page numbers (lines that are just a number, optionally with "Page" prefix)
+    let page_num_re = Regex::new(r"(?i)^\s*(page\s+)?\d+(\s+of\s+\d+)?\s*$").unwrap();
+    lines.retain(|line| !page_num_re.is_match(line));
+
+    // 3. Fix broken line wraps from PDF column layouts:
+    // If a line ends without punctuation or a heading marker and the next starts lowercase, join them.
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let current = lines[i].trim_end();
+        if i + 1 < lines.len() {
+            let next = lines[i + 1].trim_start();
+            let current_trimmed = current.trim();
+
+            // Join if: current doesn't end with sentence-ender or heading,
+            // current is not empty, next starts with lowercase
+            let should_join = !current_trimmed.is_empty()
+                && !next.is_empty()
+                && !current_trimmed.ends_with('.')
+                && !current_trimmed.ends_with(':')
+                && !current_trimmed.ends_with('!')
+                && !current_trimmed.ends_with('?')
+                && !current_trimmed.ends_with('|')
+                && !current_trimmed.starts_with('#')
+                && !current_trimmed.starts_with('-')
+                && !current_trimmed.starts_with('*')
+                && !current_trimmed.starts_with('|')
+                && !next.starts_with('#')
+                && !next.starts_with('-')
+                && !next.starts_with('*')
+                && !next.starts_with('|')
+                && !next.starts_with('>')
+                && next.starts_with(|c: char| c.is_lowercase());
+
+            if should_join {
+                result.push_str(current_trimmed);
+                result.push(' ');
+                i += 1;
+                continue;
+            }
+        }
+        result.push_str(current);
+        result.push('\n');
+        i += 1;
+    }
+
+    // 4. Collapse 3+ consecutive blank lines into 2
+    let multi_blank = Regex::new(r"\n{4,}").unwrap();
+    let result = multi_blank.replace_all(&result, "\n\n\n").to_string();
+
+    // 5. Trim leading/trailing whitespace
+    result.trim().to_string()
+}
+
+// ============================================================
+// Document structure: TOC extraction and section retrieval
+// ============================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct TocEntry {
+    /// Heading level (1-6)
+    level: usize,
+    /// Section number (e.g., "2.1.3")
+    number: String,
+    /// Heading text
+    title: String,
+    /// Character offset where this section starts
+    char_start: usize,
+    /// Character offset where this section ends
+    char_end: usize,
+    /// Estimated token count for this section
+    tokens: usize,
+    /// Whether this section contains a markdown table
+    has_table: bool,
+    /// Whether this section contains a code block
+    has_code: bool,
+}
+
+/// Extract table of contents from markdown content.
+fn extract_toc(content: &str) -> Vec<TocEntry> {
+    let heading_re = Regex::new(r"^(#{1,6})\s+(.+)$").unwrap();
+    let mut entries: Vec<TocEntry> = Vec::new();
+    let mut counters: Vec<usize> = vec![0; 7]; // index 1-6 for heading levels
+
+    // Find all heading positions
+    let mut heading_positions: Vec<(usize, usize, String)> = Vec::new();
+    for (offset, line) in content.lines().scan(0usize, |pos, line| {
+        let start = *pos;
+        *pos += line.len() + 1; // +1 for newline
+        Some((start, line))
+    }) {
+        if let Some(caps) = heading_re.captures(line) {
+            let level = caps[1].len();
+            let title = caps[2].trim().to_string();
+            heading_positions.push((offset, level, title));
+        }
+    }
+
+    for (idx, (char_start, level, title)) in heading_positions.iter().enumerate() {
+        let level = *level;
+        let char_start = *char_start;
+
+        // Calculate section end: either start of next heading at same or higher level, or end of doc
+        let char_end = heading_positions
+            .iter()
+            .skip(idx + 1)
+            .find(|(_, l, _)| *l <= level)
+            .map(|(pos, _, _)| *pos)
+            .unwrap_or(content.len());
+
+        let section_text = &content[char_start..char_end];
+
+        // Update counters for numbering
+        counters[level] += 1;
+        // Reset all deeper counters
+        for c in counters.iter_mut().skip(level + 1) {
+            *c = 0;
+        }
+
+        // Build section number
+        let number: String = counters[1..=level]
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+
+        let tokens = estimate_tokens(section_text);
+        let has_table = section_text.contains("\n|") && section_text.contains("---|");
+        let has_code = section_text.contains("```");
+
+        entries.push(TocEntry {
+            level,
+            number,
+            title: title.clone(),
+            char_start,
+            char_end,
+            tokens,
+            has_table,
+            has_code,
+        });
+    }
+
+    entries
+}
+
+/// Format TOC for display
+fn format_toc(toc: &[TocEntry], total_tokens: usize) -> String {
+    let mut out = String::new();
+    for entry in toc {
+        let indent = "  ".repeat(entry.level.saturating_sub(1));
+        let mut markers = Vec::new();
+        if entry.has_table {
+            markers.push("table");
+        }
+        if entry.has_code {
+            markers.push("code");
+        }
+        let marker_str = if markers.is_empty() {
+            String::new()
+        } else {
+            format!(", has {}", markers.join("+"))
+        };
+        out.push_str(&format!(
+            "{}{}. {} (tokens: ~{}{})\n",
+            indent, entry.number, entry.title, entry.tokens, marker_str
+        ));
+    }
+    out.push_str(&format!("\nTotal: ~{} tokens across {} sections\n", total_tokens, toc.len()));
+    out
+}
+
+/// Extract a specific section by number (e.g., "2.1") or by heading text (fuzzy match).
+fn extract_section(content: &str, selector: &str) -> Option<String> {
+    let toc = extract_toc(content);
+    if toc.is_empty() {
+        return None;
+    }
+
+    // Try exact number match first
+    if let Some(entry) = toc.iter().find(|e| e.number == selector) {
+        return Some(content[entry.char_start..entry.char_end].to_string());
+    }
+
+    // Try heading text match (case-insensitive substring)
+    let selector_lower = selector.to_lowercase();
+    if let Some(entry) = toc
+        .iter()
+        .find(|e| e.title.to_lowercase().contains(&selector_lower))
+    {
+        return Some(content[entry.char_start..entry.char_end].to_string());
+    }
+
+    None
+}
+
+/// Truncate content at a section boundary, respecting a character budget.
+fn truncate_at_boundary(content: &str, max_chars: usize, offset: usize) -> (String, Option<String>) {
+    if offset >= content.len() {
+        return (String::new(), None);
+    }
+
+    let sliced = &content[offset..];
+    if sliced.len() <= max_chars {
+        return (sliced.to_string(), None);
+    }
+
+    // Find the last heading boundary before max_chars
+    let heading_re = Regex::new(r"\n#{1,6}\s").unwrap();
+    let mut last_break = max_chars;
+
+    for m in heading_re.find_iter(&sliced[..max_chars]) {
+        last_break = m.start();
+    }
+
+    // If no heading found, try paragraph break
+    if last_break == max_chars {
+        if let Some(pos) = sliced[..max_chars].rfind("\n\n") {
+            last_break = pos;
+        }
+    }
+
+    let truncated = sliced[..last_break].trim_end().to_string();
+    let remaining_chars = sliced.len() - last_break;
+    let remaining_tokens = estimate_tokens(&sliced[last_break..]);
+
+    let toc = extract_toc(content);
+    let total_sections = toc.len();
+    let sections_shown = extract_toc(&content[..offset + last_break]).len();
+
+    let notice = format!(
+        "\n\n[truncated at char {}, ~{} tokens and ~{} chars remaining, sections {}/{}]",
+        offset + last_break,
+        remaining_tokens,
+        remaining_chars,
+        sections_shown,
+        total_sections
+    );
+
+    (truncated, Some(notice))
+}
+
+/// Filter content by page numbers. Looks for page break markers or splits by rough page boundaries.
+fn filter_pages(content: &str, pages: &[usize]) -> String {
+    // Many PDF converters insert form-feed (\x0c) or "---" page breaks.
+    // Also look for patterns like "Page N" or just form-feeds.
+    let page_break = Regex::new(r"(?:\x0c|\n-{3,}\n|\n\* \* \*\n)").unwrap();
+
+    let page_texts: Vec<&str> = page_break.split(content).collect();
+
+    if page_texts.len() <= 1 {
+        // No page breaks found - if the user asked for page 1, return everything
+        if pages.contains(&1) {
+            return content.to_string();
+        }
+        // Otherwise, we can't split by pages without markers
+        return format!(
+            "{}\n\n[note: no page break markers found in document, showing all content]",
+            content
+        );
+    }
+
+    let mut result = String::new();
+    for &page_num in pages {
+        if page_num > 0 && page_num <= page_texts.len() {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(page_texts[page_num - 1].trim());
+        }
+    }
+
+    if result.is_empty() {
+        format!(
+            "[no content found for pages {:?}, document has {} pages]",
+            pages,
+            page_texts.len()
+        )
+    } else {
+        result
+    }
+}
+
+/// Parse a page range string like "1-3,7,10-12" into a sorted list of page numbers.
+fn parse_page_range(spec: &str) -> Result<Vec<usize>> {
+    let mut pages = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.contains('-') {
+            let bounds: Vec<&str> = part.split('-').collect();
+            if bounds.len() != 2 {
+                bail!("invalid page range: {}", part);
+            }
+            let start: usize = bounds[0].trim().parse().context("invalid page number")?;
+            let end: usize = bounds[1].trim().parse().context("invalid page number")?;
+            if start == 0 || end == 0 {
+                bail!("page numbers start at 1");
+            }
+            if start > end {
+                bail!("invalid range: {} > {}", start, end);
+            }
+            for p in start..=end {
+                pages.push(p);
+            }
+        } else {
+            let p: usize = part.parse().context("invalid page number")?;
+            if p == 0 {
+                bail!("page numbers start at 1");
+            }
+            pages.push(p);
+        }
+    }
+    pages.sort();
+    pages.dedup();
+    Ok(pages)
+}
+
+// ============================================================
+// Conversion cache
+// ============================================================
+
+fn cache_dir() -> Result<PathBuf> {
+    let dir = if let Some(cache) = env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(cache).join("ingestr")
+    } else if let Some(home) = dirs::home_dir() {
+        home.join(".cache").join("ingestr")
+    } else {
+        bail!("unable to determine cache directory");
+    };
+    Ok(dir)
+}
+
+/// Compute a cache key from file hash + conversion flags.
+fn cache_key(path: &Path, meta: bool, raw: bool, vlm: bool, ocr: bool, section: &Option<String>, pages: &Option<String>) -> Result<String> {
+    let data = fs::read(path).context("reading file for cache key")?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    // Include flags in hash so different flag combos get different cache entries
+    hasher.update(if meta { b"meta=1" } else { b"meta=0" });
+    hasher.update(if raw { b"raw=1" } else { b"raw=0" });
+    hasher.update(if vlm { b"vlm=1" } else { b"vlm=0" });
+    hasher.update(if ocr { b"ocr=1" } else { b"ocr=0" });
+    if let Some(s) = section {
+        hasher.update(format!("section={s}").as_bytes());
+    }
+    if let Some(p) = pages {
+        hasher.update(format!("pages={p}").as_bytes());
+    }
+    let hash = hasher.finalize();
+    Ok(hex::encode(hash))
+}
+
+/// Try to read a cached conversion result.
+fn cache_get(key: &str) -> Result<Option<String>> {
+    let path = cache_dir()?.join(&key[..2]).join(key);
+    if path.exists() {
+        Ok(Some(fs::read_to_string(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Store a conversion result in the cache.
+fn cache_put(key: &str, content: &str) -> Result<()> {
+    let dir = cache_dir()?.join(&key[..2]);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(key), content)?;
+    Ok(())
+}
+
+fn handle_cache(ctx: &RuntimeContext, command: CacheCommand) -> Result<()> {
+    match command {
+        CacheCommand::Clear => {
+            let dir = cache_dir()?;
+            if dir.exists() {
+                let count = WalkDir::new(&dir)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_file())
+                    .count();
+                if ctx.common.dry_run {
+                    info!("dry-run: would remove {} cached files from {}", count, dir.display());
+                } else {
+                    fs::remove_dir_all(&dir)?;
+                    fs::create_dir_all(&dir)?;
+                    println!("Cleared {} cached conversions", count);
+                }
+            } else {
+                println!("Cache is empty");
+            }
+            Ok(())
+        }
+        CacheCommand::Stats => {
+            let dir = cache_dir()?;
+            if !dir.exists() {
+                if ctx.common.json {
+                    println!(r#"{{"files": 0, "size_bytes": 0, "path": "{}"}}"#, dir.display());
+                } else {
+                    println!("Cache is empty ({})", dir.display());
+                }
+                return Ok(());
+            }
+            let mut files = 0usize;
+            let mut total_size = 0u64;
+            for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+                if entry.file_type().is_file() {
+                    files += 1;
+                    total_size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+            if ctx.common.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "files": files,
+                        "size_bytes": total_size,
+                        "size_mb": format!("{:.1}", total_size as f64 / 1_048_576.0),
+                        "path": dir.display().to_string(),
+                    }))?
+                );
+            } else {
+                println!(
+                    "Cache: {} files, {:.1} MB ({})",
+                    files,
+                    total_size as f64 / 1_048_576.0,
+                    dir.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+// ============================================================
+// URL fetching
+// ============================================================
+
+/// Check if a string looks like a URL
+fn is_url(input: &str) -> bool {
+    input.starts_with("http://") || input.starts_with("https://")
+}
+
+/// Fetch a URL and save to a temp file for conversion.
+/// Returns the temp file path and a cleanup guard.
+fn fetch_url(url: &str) -> Result<PathBuf> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("ingestr/0.1")
+        .build()
+        .context("building HTTP client")?;
+
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("fetching URL: {url}"))?;
+
+    if !response.status().is_success() {
+        bail!("HTTP {} fetching {}", response.status(), url);
+    }
+
+    // Determine extension from Content-Type or URL
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let ext = if content_type.contains("pdf") {
+        "pdf"
+    } else if content_type.contains("html") {
+        "html"
+    } else if content_type.contains("json") {
+        "json"
+    } else if content_type.contains("xml") {
+        "xml"
+    } else if content_type.contains("wordprocessingml") || content_type.contains("docx") {
+        "docx"
+    } else if content_type.contains("spreadsheetml") || content_type.contains("xlsx") {
+        "xlsx"
+    } else if content_type.contains("presentationml") || content_type.contains("pptx") {
+        "pptx"
+    } else {
+        // Try to get extension from URL path
+        url.rsplit('/')
+            .next()
+            .and_then(|segment| segment.rsplit('.').next())
+            .filter(|ext| ext.len() <= 5 && ext.chars().all(|c| c.is_alphanumeric()))
+            .unwrap_or("html")
+    };
+
+    let temp_path = std::env::temp_dir().join(format!("ingestr-url.{ext}"));
+    let bytes = response.bytes().context("reading response body")?;
+    fs::write(&temp_path, &bytes).context("writing fetched content to temp file")?;
+
+    Ok(temp_path)
+}
+
+// ============================================================
+// Clipboard support
+// ============================================================
+
+/// Read content from the system clipboard and save to a temp file.
+fn read_clipboard() -> Result<PathBuf> {
+    let mut clipboard = arboard::Clipboard::new().context("accessing clipboard")?;
+
+    // Try to get text (which might be HTML or plain text)
+    match clipboard.get_text() {
+        Ok(text) if !text.trim().is_empty() => {
+            let ext = detect_format_from_content(text.as_bytes());
+            let temp_path = std::env::temp_dir().join(format!("ingestr-clipboard.{ext}"));
+            fs::write(&temp_path, &text).context("writing clipboard to temp file")?;
+            Ok(temp_path)
+        }
+        _ => {
+            // Try image
+            match clipboard.get_image() {
+                Ok(img) => {
+                    let temp_path = std::env::temp_dir().join("ingestr-clipboard.png");
+                    // arboard gives us raw RGBA data; write as PNG
+                    let mut png_data = Vec::new();
+                    let mut encoder = io::Cursor::new(&mut png_data);
+                    // Simple BMP-like approach: just write the raw bytes and let markitdown handle it
+                    // Actually, we need a proper image format. Let's write raw RGBA and use a simple approach.
+                    // For now, write a simple PPM which is easy to generate
+                    write!(
+                        encoder,
+                        "P6\n{} {}\n255\n",
+                        img.width, img.height
+                    )?;
+                    for pixel in img.bytes.chunks(4) {
+                        encoder.write_all(&pixel[..3])?; // RGB, skip A
+                    }
+                    fs::write(&temp_path, &png_data).context("writing clipboard image")?;
+                    // Rename to .ppm since that's what we wrote
+                    let ppm_path = std::env::temp_dir().join("ingestr-clipboard.ppm");
+                    fs::rename(&temp_path, &ppm_path).ok();
+                    Ok(ppm_path)
+                }
+                Err(_) => bail!("clipboard is empty or contains unsupported content"),
+            }
+        }
+    }
 }
 
 /// Statistics for batch conversion
@@ -1043,7 +1709,11 @@ struct DocumentProcessor {
     markitdown: MarkItDown,
     settings: ServiceSettings,
     vlm_enabled: bool,
+    vlm_model: Option<String>,
     vlm_prompt: Option<String>,
+    jobs: usize,
+    /// Output file for streaming VLM results (pages written as they complete)
+    vlm_output: Option<PathBuf>,
     ocr_enabled: bool,
     ocr_backend: OcrBackend,
     ocr_languages: Vec<String>,
@@ -1056,16 +1726,22 @@ impl DocumentProcessor {
             markitdown: MarkItDown::new(),
             settings,
             vlm_enabled: false,
+            vlm_model: None,
             vlm_prompt: None,
+            jobs: 1,
+            vlm_output: None,
             ocr_enabled: false,
             ocr_backend: OcrBackend::Tesseract,
             ocr_languages: vec!["eng".to_string()],
         }
     }
 
-    fn with_vlm(mut self, enabled: bool, prompt: Option<String>) -> Self {
+    fn with_vlm(mut self, enabled: bool, model: Option<String>, prompt: Option<String>, jobs: usize, output: Option<PathBuf>) -> Self {
         self.vlm_enabled = enabled || self.settings.processors.vlm.enabled;
+        self.vlm_model = model;
         self.vlm_prompt = prompt;
+        self.jobs = jobs.max(1);
+        self.vlm_output = output;
         self
     }
 
@@ -1087,9 +1763,15 @@ impl DocumentProcessor {
             .map(|s| s.to_lowercase())
             .unwrap_or_default();
 
-        // Check if this is an image and VLM is enabled
+        // Check if VLM is enabled for images, PDFs, or presentations
         if self.vlm_enabled && is_image_extension(&extension) {
             return self.process_with_vlm(input, &extension);
+        }
+        if self.vlm_enabled && is_pdf_extension(&extension) {
+            return self.process_pdf_with_vlm(input);
+        }
+        if self.vlm_enabled && is_presentation_extension(&extension) {
+            return self.process_pptx_with_vlm(input);
         }
 
         // Try markitdown first
@@ -1102,6 +1784,7 @@ impl DocumentProcessor {
                 return Ok(ConvertedDocument {
                     title: result.title,
                     text_content: result.text_content,
+                    already_written: false,
                 });
             }
             _ => {}
@@ -1127,7 +1810,25 @@ impl DocumentProcessor {
         Ok(ConvertedDocument {
             title: None,
             text_content: text,
+            already_written: false,
         })
+    }
+
+    /// Resolve effective VLM connection settings.
+    /// Priority: CLI --vlm-model > [processors.vlm].model > [llm].model
+    /// Priority: [processors.vlm].llm_url > [llm].base_url > localhost:11434
+    fn vlm_connection(&self) -> (String, String) {
+        let vlm = &self.settings.processors.vlm;
+        let url = vlm.llm_url.clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.settings.llm_base_url.clone())
+            .unwrap_or_else(|| "http://localhost:11434".to_string());
+        let model = self.vlm_model.clone()
+            .or_else(|| vlm.model.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.settings.llm_model.clone());
+        info!("VLM connection: url={}, model={}", url, model);
+        (url, model)
     }
 
     fn build_conversion_options(&self) -> Option<ConversionOptions> {
@@ -1168,15 +1869,9 @@ impl DocumentProcessor {
             _ => "image/png",
         };
 
-        // Call EAVS for VLM processing
-        let description = call_eavs_vlm(
-            &vlm_config.eavs_url,
-            &vlm_config.provider,
-            &vlm_config.model,
-            &base64_image,
-            mime_type,
-            prompt,
-        )?;
+        // Call VLM API
+        let (url, model) = self.vlm_connection();
+        let description = call_vlm_api(&url, &model, &base64_image, mime_type, prompt)?;
 
         let title = input.file_stem()
             .and_then(|s| s.to_str())
@@ -1188,6 +1883,7 @@ impl DocumentProcessor {
                 input.file_name().and_then(|s| s.to_str()).unwrap_or("image"),
                 description
             ),
+            already_written: false,
         })
     }
 
@@ -1201,7 +1897,323 @@ impl DocumentProcessor {
         Ok(ConvertedDocument {
             title,
             text_content: text,
+            already_written: false,
         })
+    }
+
+    /// Convert a PDF page-by-page using VLM: render each page to an image with
+    /// pdftoppm, send each image through the vision model, and concatenate the
+    /// descriptions into a single markdown document.
+    fn process_pdf_with_vlm(&self, input: &Path) -> Result<ConvertedDocument> {
+        let vlm_config = &self.settings.processors.vlm;
+        let prompt = self.vlm_prompt.as_ref()
+            .or(vlm_config.prompts.get("default"))
+            .map(|s| s.as_str())
+            .unwrap_or("Describe this page in detail, including all visible text, tables, figures, and layout.");
+
+        let temp_dir = std::env::temp_dir().join("ingestr-pdf-vlm");
+        fs::create_dir_all(&temp_dir)?;
+
+        // Render PDF pages to PNG images using pdftoppm
+        eprint!("Rendering PDF pages...");
+        let status = ProcCommand::new("pdftoppm")
+            .args(["-png", "-r", "200"])
+            .arg(input)
+            .arg(temp_dir.join("page"))
+            .status()
+            .context("running pdftoppm (is poppler installed?)")?;
+
+        if !status.success() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            bail!("pdftoppm failed with status {}", status);
+        }
+
+        // Collect page images sorted by name
+        let mut page_images: Vec<PathBuf> = fs::read_dir(&temp_dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+            .collect();
+        page_images.sort();
+
+        if page_images.is_empty() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            bail!("pdftoppm produced no page images");
+        }
+
+        let total_pages = page_images.len();
+        let (url, model) = self.vlm_connection();
+        eprintln!(" {} pages (model: {})", total_pages, model);
+
+        let filename = input.file_name().and_then(|s| s.to_str()).unwrap_or("document");
+        let header = format!("# {}\n", filename);
+
+        // Resolve output file: explicit -o, or default to <stem>.md in cwd
+        let output_path = self.vlm_output.clone().unwrap_or_else(|| {
+            let stem = input.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("document");
+            PathBuf::from(format!("{}.md", stem))
+        });
+
+        // Write header immediately
+        fs::write(&output_path, &header)
+            .with_context(|| format!("writing to {}", output_path.display()))?;
+        eprintln!("Streaming to {}", output_path.display());
+
+        // Process pages with thread pool, streaming to file
+        let jobs = self.jobs.min(total_pages);
+        let sections = self.process_vlm_pages_parallel(
+            &page_images, &url, &model, prompt, total_pages, jobs, "Page", &output_path,
+        );
+
+        // Clean up temp images
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let title = input.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        let text_content = format!(
+            "{}\n{}\n",
+            header,
+            sections.join("\n\n")
+        );
+
+        // Write final clean version (replaces the streamed file)
+        fs::write(&output_path, &text_content)
+            .with_context(|| format!("writing final output to {}", output_path.display()))?;
+
+        Ok(ConvertedDocument { title, text_content, already_written: true })
+    }
+
+    /// Process page images through VLM in parallel, streaming results to a file
+    /// as they complete (in order). Shows progress on stderr.
+    fn process_vlm_pages_parallel(
+        &self,
+        page_images: &[PathBuf],
+        url: &str,
+        model: &str,
+        prompt: &str,
+        total: usize,
+        jobs: usize,
+        label: &str,
+        output_path: &Path,
+    ) -> Vec<String> {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (tx, rx) = mpsc::channel::<(usize, String)>();
+
+        // Read all images upfront so threads don't need filesystem access
+        let images: Vec<(usize, Vec<u8>)> = page_images.iter().enumerate()
+            .filter_map(|(i, path)| {
+                fs::read(path).ok().map(|data| (i, data))
+            })
+            .collect();
+
+        let url = url.to_string();
+        let model = model.to_string();
+        let prompt = prompt.to_string();
+
+        // Spawn worker threads
+        let chunk_size = (images.len() + jobs - 1) / jobs;
+        let mut handles = Vec::new();
+
+        for chunk in images.chunks(chunk_size) {
+            let chunk: Vec<(usize, Vec<u8>)> = chunk.to_vec();
+            let tx = tx.clone();
+            let url = url.clone();
+            let model = model.clone();
+            let prompt = prompt.clone();
+
+            let handle = thread::spawn(move || {
+                for (page_idx, image_data) in chunk {
+                    let base64_image = base64_encode(&image_data);
+                    let result = match call_vlm_api(&url, &model, &base64_image, "image/png", &prompt) {
+                        Ok(desc) => desc,
+                        Err(e) => format!("[VLM processing failed: {}]", e),
+                    };
+                    let _ = tx.send((page_idx, result));
+                }
+            });
+            handles.push(handle);
+        }
+        drop(tx); // Close sender so rx iterator terminates
+
+        // Collect results, append to file in order as pages become ready
+        let mut results: Vec<Option<String>> = vec![None; total];
+        let mut next_to_write = 0;
+        let mut completed = 0;
+        let start = std::time::Instant::now();
+        let label = label.to_string();
+
+        // Open file in append mode for streaming
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(output_path)
+            .unwrap_or_else(|_| fs::File::create(output_path).expect("create output file"));
+
+        for (page_idx, description) in rx {
+            completed += 1;
+            let page_num = page_idx + 1;
+            let elapsed = start.elapsed().as_secs_f32();
+            let avg = elapsed / completed as f32;
+            let remaining = avg * (total - completed) as f32;
+            eprint!(
+                "\r\x1b[K[{}/{}] {} {} done ({:.1}s avg, ~{:.0}s remaining)",
+                completed, total, label, page_num, avg, remaining
+            );
+
+            let section = format!("## {} {}\n\n{}", label, page_num, description);
+            results[page_idx] = Some(section);
+
+            // Append all consecutive ready pages to file
+            while next_to_write < total {
+                if let Some(ref s) = results[next_to_write] {
+                    let _ = writeln!(file, "\n{}", s);
+                    let _ = file.flush();
+                    next_to_write += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Wait for all threads
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let elapsed = start.elapsed().as_secs_f32();
+        eprintln!(
+            "\r\x1b[K[{}/{}] All {} pages done in {:.1}s -> {}",
+            total, total, label.to_lowercase(), elapsed, output_path.display()
+        );
+
+        results.into_iter().flatten().collect()
+    }
+
+    /// Convert a PPTX slide-by-slide using VLM: first convert to PDF with
+    /// LibreOffice, then render each page to an image and send through VLM.
+    fn process_pptx_with_vlm(&self, input: &Path) -> Result<ConvertedDocument> {
+        let vlm_config = &self.settings.processors.vlm;
+        let prompt = self.vlm_prompt.as_ref()
+            .or(vlm_config.prompts.get("screenshot"))
+            .or(vlm_config.prompts.get("default"))
+            .map(|s| s.as_str())
+            .unwrap_or("Describe this presentation slide in detail, including all text, diagrams, charts, images, bullet points, and visual layout.");
+
+        let temp_dir = std::env::temp_dir().join("ingestr-pptx-vlm");
+        fs::create_dir_all(&temp_dir)?;
+
+        // Step 1: Convert to PDF using LibreOffice
+        eprint!("Converting to PDF...");
+        let status = ProcCommand::new("soffice")
+            .args(["--headless", "--convert-to", "pdf", "--outdir"])
+            .arg(&temp_dir)
+            .arg(input)
+            .status()
+            .context("running LibreOffice (is soffice installed?)")?;
+
+        if !status.success() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            bail!("LibreOffice conversion failed with status {}", status);
+        }
+
+        // Find the generated PDF
+        let pdf_path = {
+            let stem = input.file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| anyhow!("invalid input filename"))?;
+            let pdf = temp_dir.join(format!("{}.pdf", stem));
+            if !pdf.exists() {
+                // Try to find any PDF in the temp dir
+                fs::read_dir(&temp_dir)?
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .find(|p| p.extension().and_then(|e| e.to_str()) == Some("pdf"))
+                    .ok_or_else(|| anyhow!("LibreOffice produced no PDF output"))?
+            } else {
+                pdf
+            }
+        };
+
+        // Step 2: Render slides to images
+        eprint!(" Rendering slides...");
+        let status = ProcCommand::new("pdftoppm")
+            .args(["-png", "-r", "200"])
+            .arg(&pdf_path)
+            .arg(temp_dir.join("slide"))
+            .status()
+            .context("running pdftoppm (is poppler installed?)")?;
+
+        if !status.success() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            bail!("pdftoppm failed with status {}", status);
+        }
+
+        // Collect slide images sorted by name
+        let mut slide_images: Vec<PathBuf> = fs::read_dir(&temp_dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("slide") && n.ends_with(".png"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        slide_images.sort();
+
+        if slide_images.is_empty() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            bail!("pdftoppm produced no slide images");
+        }
+
+        let (url, model) = self.vlm_connection();
+        let total_slides = slide_images.len();
+        eprintln!(" {} slides (model: {})", total_slides, model);
+
+        let filename = input.file_name().and_then(|s| s.to_str()).unwrap_or("presentation");
+        let header = format!("# {}\n", filename);
+
+        // Resolve output file
+        let output_path = self.vlm_output.clone().unwrap_or_else(|| {
+            let stem = input.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("presentation");
+            PathBuf::from(format!("{}.md", stem))
+        });
+
+        // Write header immediately
+        fs::write(&output_path, &header)
+            .with_context(|| format!("writing to {}", output_path.display()))?;
+        eprintln!("Streaming to {}", output_path.display());
+
+        let jobs = self.jobs.min(total_slides);
+        let sections = self.process_vlm_pages_parallel(
+            &slide_images, &url, &model, prompt, total_slides, jobs, "Slide", &output_path,
+        );
+
+        // Clean up temp files
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let title = input.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+
+        let text_content = format!(
+            "{}\n{}\n",
+            header,
+            sections.join("\n\n")
+        );
+
+        // Write final clean version
+        fs::write(&output_path, &text_content)
+            .with_context(|| format!("writing final output to {}", output_path.display()))?;
+
+        Ok(ConvertedDocument { title, text_content, already_written: true })
     }
 }
 
@@ -1211,6 +2223,10 @@ fn is_image_extension(ext: &str) -> bool {
 
 fn is_pdf_extension(ext: &str) -> bool {
     ext == "pdf"
+}
+
+fn is_presentation_extension(ext: &str) -> bool {
+    matches!(ext, "pptx" | "ppt" | "odp" | "key")
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -1241,16 +2257,20 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
-/// Call EAVS server for VLM processing
-fn call_eavs_vlm(
-    eavs_url: &str,
-    provider: &str,
+/// Call an OpenAI-compatible LLM API for vision processing.
+/// Works with Ollama, LM Studio, vLLM, or any server implementing
+/// the OpenAI /v1/chat/completions endpoint with vision support.
+fn call_vlm_api(
+    llm_url: &str,
     model: &str,
     base64_image: &str,
     mime_type: &str,
     prompt: &str,
 ) -> Result<String> {
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .context("building VLM HTTP client")?;
     
     let request_body = serde_json::json!({
         "model": model,
@@ -1272,27 +2292,28 @@ fn call_eavs_vlm(
         "max_tokens": 4096
     });
 
+    info!("VLM request to {}/v1/chat/completions model={}", llm_url, model);
+
     let response = client
-        .post(format!("{}/v1/chat/completions", eavs_url))
+        .post(format!("{}/v1/chat/completions", llm_url))
         .header("Content-Type", "application/json")
-        .header("X-Provider", provider)
         .json(&request_body)
         .send()
-        .context("sending request to EAVS")?;
+        .context("sending VLM request")?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
-        bail!("EAVS request failed with status {}: {}", status, body);
+        bail!("VLM request failed with status {}: {}", status, body);
     }
 
     let response_json: serde_json::Value = response.json()
-        .context("parsing EAVS response")?;
+        .context("parsing VLM response")?;
 
     response_json["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("invalid response format from EAVS"))
+        .ok_or_else(|| anyhow!("invalid response format from VLM API"))
 }
 
 /// Run OCR on a file
@@ -1366,15 +2387,33 @@ fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
     })?;
     settings.index_enabled = false;
 
+    // Clipboard input
+    if cmd.clipboard {
+        let temp_path = read_clipboard()?;
+        let result = convert_single_input(ctx, &cmd, &settings, &temp_path, "clipboard")?;
+        let _ = fs::remove_file(&temp_path);
+        return result;
+    }
+
     // Check if reading from stdin
-    let is_stdin = cmd.input.is_none() 
-        || cmd.input.as_ref().map(|p| p.as_os_str() == "-").unwrap_or(false);
+    let is_stdin = cmd.input.is_none()
+        || cmd.input.as_ref().map(|s| s == "-").unwrap_or(false);
 
     if is_stdin {
         return handle_convert_stdin(ctx, &cmd, &settings);
     }
 
-    let input = expand_path(cmd.input.clone().unwrap())?;
+    let input_str = cmd.input.as_ref().unwrap().clone();
+
+    // URL input
+    if is_url(&input_str) {
+        let temp_path = fetch_url(&input_str)?;
+        let result = convert_single_input(ctx, &cmd, &settings, &temp_path, &input_str);
+        let _ = fs::remove_file(&temp_path);
+        return result?;
+    }
+
+    let input = expand_path(PathBuf::from(&input_str))?;
 
     // Check if input is a directory
     if input.is_dir() {
@@ -1386,50 +2425,188 @@ fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
         bail!("input path is not a file or directory: {}", input.display());
     }
 
-    let processor = DocumentProcessor::new(settings)
-        .with_vlm(cmd.vlm, cmd.vlm_prompt.clone())
+    let source_label = input.display().to_string();
+    convert_single_input(ctx, &cmd, &settings, &input, &source_label)?
+}
+
+/// Core single-file conversion with all the new features:
+/// caching, cleaning, TOC, section extraction, token budget, frontmatter control.
+fn convert_single_input(
+    ctx: &RuntimeContext,
+    cmd: &ConvertCommand,
+    settings: &ServiceSettings,
+    input: &Path,
+    source_label: &str,
+) -> Result<Result<()>> {
+    // Check cache first (unless --no-cache or --toc which is always computed fresh)
+    if !cmd.no_cache && !cmd.toc && input.exists() {
+        if let Ok(key) = cache_key(input, cmd.meta, cmd.raw, cmd.vlm, cmd.ocr, &cmd.section, &cmd.pages) {
+            if let Ok(Some(cached)) = cache_get(&key) {
+                debug!("cache hit for {}", source_label);
+                return Ok(output_final(ctx, cmd, cached, source_label));
+            }
+        }
+    }
+
+    let processor = DocumentProcessor::new(settings.clone())
+        .with_vlm(cmd.vlm, cmd.vlm_model.clone(), cmd.vlm_prompt.clone(), cmd.jobs, cmd.output.clone())
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
 
-    let converted = processor.process(&input)?;
+    let converted = processor.process(input)?;
 
-    let output = cmd
-        .output
-        .map(expand_path)
-        .transpose()
-        .context("expanding output path")?;
+    // Apply page filtering if --pages was specified
+    let text_content = if let Some(ref page_spec) = cmd.pages {
+        let pages = parse_page_range(page_spec)?;
+        filter_pages(&converted.text_content, &pages)
+    } else {
+        converted.text_content.clone()
+    };
 
-    let output_path_str = output
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "-".to_string());
+    // Apply cleaning unless --raw
+    let content = if cmd.raw {
+        text_content
+    } else {
+        clean_markdown(&text_content)
+    };
 
+    // TOC mode: just show structure and exit
+    if cmd.toc {
+        let toc = extract_toc(&content);
+        let total_tokens = estimate_tokens(&content);
+        if ctx.common.json {
+            let output = serde_json::json!({
+                "source": source_label,
+                "total_tokens": total_tokens,
+                "sections": toc,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else if ctx.common.yaml {
+            let output = serde_json::json!({
+                "source": source_label,
+                "total_tokens": total_tokens,
+                "sections": toc,
+            });
+            println!("{}", serde_yaml::to_string(&output)?);
+        } else {
+            println!("{}", format_toc(&toc, total_tokens));
+        }
+        return Ok(Ok(()));
+    }
+
+    // Section extraction
+    let content = if let Some(ref selector) = cmd.section {
+        extract_section(&content, selector)
+            .ok_or_else(|| anyhow!("section '{}' not found", selector))?
+    } else {
+        content
+    };
+
+    // Token/char budget truncation
+    let content = if let Some(max_tokens) = cmd.max_tokens {
+        let max_chars = max_tokens * 4; // rough estimate: 4 chars per token
+        let (truncated, notice) = truncate_at_boundary(&content, max_chars, cmd.offset);
+        if let Some(notice) = notice {
+            format!("{truncated}{notice}")
+        } else {
+            truncated
+        }
+    } else if let Some(max_chars) = cmd.max_chars {
+        let (truncated, notice) = truncate_at_boundary(&content, max_chars, cmd.offset);
+        if let Some(notice) = notice {
+            format!("{truncated}{notice}")
+        } else {
+            truncated
+        }
+    } else if cmd.offset > 0 {
+        if cmd.offset >= content.len() {
+            String::new()
+        } else {
+            content[cmd.offset..].to_string()
+        }
+    } else {
+        content
+    };
+
+    // Build final output
     let converted_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    let source_modified = fs::metadata(&input)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .and_then(system_time_to_rfc3339);
-
-    let frontmatter = Frontmatter {
-        source_path: input.display().to_string(),
-        output_path: output_path_str.clone(),
-        source_modified: source_modified.clone(),
-        title: converted.title.clone(),
-        converted_at: converted_at.clone(),
+    let source_modified = if input.exists() {
+        fs::metadata(input)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_to_rfc3339)
+    } else {
+        None
     };
 
-    let markdown = render_frontmatter_markdown(&frontmatter, &converted.text_content)?;
+    let final_output = if cmd.meta {
+        let frontmatter = Frontmatter {
+            source_path: source_label.to_string(),
+            output_path: cmd.output.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".to_string()),
+            source_modified: source_modified.clone(),
+            title: converted.title.clone(),
+            converted_at: converted_at.clone(),
+        };
+        render_frontmatter_markdown(&frontmatter, &content)?
+    } else {
+        content.clone()
+    };
 
-    output_convert_result(ctx, output, &ConvertResult {
-        source_path: input.display().to_string(),
-        output_path: output_path_str,
-        source_modified,
-        title: converted.title,
-        converted_at,
-        markdown,
-    })
+    // Store in cache (for file inputs only, not URLs/clipboard)
+    if !cmd.no_cache && input.exists() && cmd.section.is_none() && cmd.max_tokens.is_none() && cmd.max_chars.is_none() && cmd.offset == 0 {
+        if let Ok(key) = cache_key(input, cmd.meta, cmd.raw, cmd.vlm, cmd.ocr, &cmd.section, &cmd.pages) {
+            let _ = cache_put(&key, &final_output);
+        }
+    }
+
+    // If VLM already streamed to file, skip normal output
+    if converted.already_written {
+        return Ok(Ok(()));
+    }
+
+    Ok(output_final(ctx, cmd, final_output, source_label))
+}
+
+/// Output the final converted content to stdout, file, or JSON/YAML.
+fn output_final(
+    ctx: &RuntimeContext,
+    cmd: &ConvertCommand,
+    content: String,
+    source_label: &str,
+) -> Result<()> {
+    if let Some(ref output_path) = cmd.output {
+        let output_path = expand_path(output_path.clone())?;
+        if ctx.common.dry_run {
+            info!("dry-run: would write to {}", output_path.display());
+        } else {
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&output_path, &content)?;
+            if !ctx.common.quiet {
+                println!("Converted {} -> {}", source_label, output_path.display());
+            }
+        }
+    } else if ctx.common.json {
+        let result = serde_json::json!({
+            "source": source_label,
+            "tokens": estimate_tokens(&content),
+            "content": content,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if ctx.common.yaml {
+        let result = serde_json::json!({
+            "source": source_label,
+            "tokens": estimate_tokens(&content),
+            "content": content,
+        });
+        println!("{}", serde_yaml::to_string(&result)?);
+    } else {
+        print!("{}", content);
+    }
+    Ok(())
 }
 
 fn handle_convert_stdin(
@@ -1457,51 +2634,9 @@ fn handle_convert_stdin(
     fs::write(&temp_file, &content)
         .context("writing stdin content to temp file")?;
 
-    let processor = DocumentProcessor::new(settings.clone())
-        .with_vlm(cmd.vlm, cmd.vlm_prompt.clone())
-        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
-
-    let converted = processor.process(&temp_file);
-    
-    // Clean up temp file
+    let result = convert_single_input(ctx, cmd, settings, &temp_file, "stdin");
     let _ = fs::remove_file(&temp_file);
-
-    let converted = converted?;
-
-    let output = cmd
-        .output
-        .as_ref()
-        .map(|p| expand_path(p.clone()))
-        .transpose()
-        .context("expanding output path")?;
-
-    let output_path_str = output
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "-".to_string());
-
-    let converted_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let frontmatter = Frontmatter {
-        source_path: "stdin".to_string(),
-        output_path: output_path_str.clone(),
-        source_modified: None,
-        title: converted.title.clone(),
-        converted_at: converted_at.clone(),
-    };
-
-    let markdown = render_frontmatter_markdown(&frontmatter, &converted.text_content)?;
-
-    output_convert_result(ctx, output, &ConvertResult {
-        source_path: "stdin".to_string(),
-        output_path: output_path_str,
-        source_modified: None,
-        title: converted.title,
-        converted_at,
-        markdown,
-    })
+    result?
 }
 
 fn detect_format_from_content(content: &[u8]) -> &'static str {
@@ -1696,7 +2831,7 @@ fn process_file_for_batch(
     errors: &std::sync::Mutex<Vec<String>>,
 ) -> Result<ConvertResult> {
     let processor = DocumentProcessor::new(settings.clone())
-        .with_vlm(cmd.vlm, cmd.vlm_prompt.clone())
+        .with_vlm(cmd.vlm, cmd.vlm_model.clone(), cmd.vlm_prompt.clone(), cmd.jobs, cmd.output.clone())
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
 
     match processor.process(file) {
@@ -1719,15 +2854,26 @@ fn process_file_for_batch(
                 .and_then(|meta| meta.modified().ok())
                 .and_then(system_time_to_rfc3339);
 
-            let frontmatter = Frontmatter {
-                source_path: file.display().to_string(),
-                output_path: output_path.display().to_string(),
-                source_modified: source_modified.clone(),
-                title: doc.title.clone(),
-                converted_at: converted_at.clone(),
+            // Apply cleaning unless --raw
+            let content = if cmd.raw {
+                doc.text_content.clone()
+            } else {
+                clean_markdown(&doc.text_content)
             };
 
-            let markdown = render_frontmatter_markdown(&frontmatter, &doc.text_content)?;
+            // Build output: frontmatter only if --meta
+            let markdown = if cmd.meta {
+                let frontmatter = Frontmatter {
+                    source_path: file.display().to_string(),
+                    output_path: output_path.display().to_string(),
+                    source_modified: source_modified.clone(),
+                    title: doc.title.clone(),
+                    converted_at: converted_at.clone(),
+                };
+                render_frontmatter_markdown(&frontmatter, &content)?
+            } else {
+                content
+            };
 
             // Write output file if output_dir is specified
             if output_dir.is_some() {
@@ -1757,35 +2903,6 @@ fn process_file_for_batch(
             Err(e)
         }
     }
-}
-
-fn output_convert_result(
-    ctx: &RuntimeContext,
-    output: Option<PathBuf>,
-    result: &ConvertResult,
-) -> Result<()> {
-    if let Some(output) = output {
-        if ctx.common.dry_run {
-            info!("dry-run: would write markdown to {}", output.display());
-        } else {
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating output directory {}", parent.display()))?;
-            }
-            fs::write(&output, &result.markdown)
-                .with_context(|| format!("writing markdown to {}", output.display()))?;
-            if !ctx.common.quiet {
-                println!("Converted {} -> {}", result.source_path, output.display());
-            }
-        }
-    } else if ctx.common.json {
-        println!("{}", serde_json::to_string_pretty(result)?);
-    } else if ctx.common.yaml {
-        println!("{}", serde_yaml::to_string(result)?);
-    } else {
-        print!("{}", result.markdown);
-    }
-    Ok(())
 }
 
 fn handle_init(ctx: &RuntimeContext, cmd: InitCommand) -> Result<()> {
@@ -2551,7 +3668,7 @@ mod tests {
 
         let settings = create_test_settings();
         let processor = DocumentProcessor::new(settings)
-            .with_vlm(false, None);
+            .with_vlm(false, None, None, 1, None);
         
         assert!(!processor.vlm_enabled);
         
@@ -2842,5 +3959,183 @@ mod tests {
         assert_eq!(parsed.source_path, result.source_path);
 
         Ok(())
+    }
+
+    // ===== New feature tests =====
+
+    #[test]
+    fn clean_markdown_removes_page_numbers() {
+        let input = "Some content\n\nPage 3 of 12\n\nMore content\n\n5\n\nEnd";
+        let cleaned = clean_markdown(input);
+        assert!(!cleaned.contains("Page 3 of 12"));
+        assert!(!cleaned.contains("\n5\n"));
+        assert!(cleaned.contains("Some content"));
+        assert!(cleaned.contains("More content"));
+    }
+
+    #[test]
+    fn clean_markdown_collapses_blank_lines() {
+        let input = "A\n\n\n\n\n\nB";
+        let cleaned = clean_markdown(input);
+        assert!(!cleaned.contains("\n\n\n\n"));
+        assert!(cleaned.contains("A"));
+        assert!(cleaned.contains("B"));
+    }
+
+    #[test]
+    fn clean_markdown_joins_broken_lines() {
+        let input = "The results\nshow that our\nrevenue grew.";
+        let cleaned = clean_markdown(input);
+        assert!(cleaned.contains("The results show that our revenue grew."));
+    }
+
+    #[test]
+    fn clean_markdown_preserves_headings() {
+        let input = "# Title\n\nParagraph\n\n## Subtitle\n\nMore text";
+        let cleaned = clean_markdown(input);
+        assert!(cleaned.contains("# Title"));
+        assert!(cleaned.contains("## Subtitle"));
+    }
+
+    #[test]
+    fn extract_toc_basic() {
+        let content = "# Intro\nSome text\n## Sub\nMore text\n# End\nFinal";
+        let toc = extract_toc(content);
+        assert_eq!(toc.len(), 3);
+        assert_eq!(toc[0].number, "1");
+        assert_eq!(toc[0].title, "Intro");
+        assert_eq!(toc[0].level, 1);
+        assert_eq!(toc[1].number, "1.1");
+        assert_eq!(toc[1].title, "Sub");
+        assert_eq!(toc[2].number, "2");
+        assert_eq!(toc[2].title, "End");
+    }
+
+    #[test]
+    fn extract_section_by_number() {
+        let content = "# First\nContent A\n# Second\nContent B\n# Third\nContent C";
+        let section = extract_section(content, "2");
+        assert!(section.is_some());
+        let text = section.unwrap();
+        assert!(text.contains("# Second"));
+        assert!(text.contains("Content B"));
+        assert!(!text.contains("Content A"));
+        assert!(!text.contains("Content C"));
+    }
+
+    #[test]
+    fn extract_section_by_name() {
+        let content = "# Introduction\nHello\n# Methods\nWorld\n# Results\nDone";
+        let section = extract_section(content, "methods");
+        assert!(section.is_some());
+        assert!(section.unwrap().contains("World"));
+    }
+
+    #[test]
+    fn extract_section_not_found() {
+        let content = "# Title\nContent";
+        assert!(extract_section(content, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn truncate_at_boundary_within_budget() {
+        let content = "Short text";
+        let (result, notice) = truncate_at_boundary(content, 100, 0);
+        assert_eq!(result, "Short text");
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn truncate_at_boundary_cuts() {
+        let content = "# First\nAAA\n\n# Second\nBBB\n\n# Third\nCCC";
+        let (result, notice) = truncate_at_boundary(content, 20, 0);
+        assert!(result.len() <= 20);
+        assert!(notice.is_some());
+        assert!(notice.unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn parse_page_range_single() {
+        let pages = parse_page_range("5").unwrap();
+        assert_eq!(pages, vec![5]);
+    }
+
+    #[test]
+    fn parse_page_range_range() {
+        let pages = parse_page_range("2-5").unwrap();
+        assert_eq!(pages, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn parse_page_range_complex() {
+        let pages = parse_page_range("1-3,7,10-12").unwrap();
+        assert_eq!(pages, vec![1, 2, 3, 7, 10, 11, 12]);
+    }
+
+    #[test]
+    fn parse_page_range_zero_rejected() {
+        assert!(parse_page_range("0").is_err());
+    }
+
+    #[test]
+    fn parse_page_range_invalid_rejected() {
+        assert!(parse_page_range("abc").is_err());
+    }
+
+    #[test]
+    fn estimate_tokens_basic() {
+        // ~4 chars per token
+        let text = "Hello world, this is a test sentence.";
+        let tokens = estimate_tokens(text);
+        assert!(tokens > 0);
+        assert!(tokens < text.len()); // Should be less than char count
+    }
+
+    #[test]
+    fn is_url_detection() {
+        assert!(is_url("https://example.com"));
+        assert!(is_url("http://example.com/path"));
+        assert!(!is_url("/local/path"));
+        assert!(!is_url("file.pdf"));
+        assert!(!is_url("service"));
+    }
+
+    #[test]
+    fn filter_pages_no_breaks() {
+        let content = "All in one page without breaks";
+        let result = filter_pages(content, &[1]);
+        assert!(result.contains("All in one page"));
+    }
+
+    #[test]
+    fn filter_pages_with_formfeed() {
+        let content = "Page one content\x0cPage two content\x0cPage three content";
+        let result = filter_pages(content, &[2]);
+        assert!(result.contains("Page two content"));
+        assert!(!result.contains("Page one"));
+        assert!(!result.contains("Page three"));
+    }
+
+    #[test]
+    fn filter_pages_range() {
+        let content = "Page 1\x0cPage 2\x0cPage 3\x0cPage 4";
+        let result = filter_pages(content, &[1, 3]);
+        assert!(result.contains("Page 1"));
+        assert!(result.contains("Page 3"));
+        assert!(!result.contains("Page 2"));
+        assert!(!result.contains("Page 4"));
+    }
+
+    #[test]
+    fn toc_detects_tables_and_code() {
+        let content = "# Section A\nNo special content\n# Section B\n| col1 | col2 |\n|---|---|\n| a | b |\n# Section C\n```rust\nfn main() {}\n```\n";
+        let toc = extract_toc(content);
+        assert_eq!(toc.len(), 3);
+        assert!(!toc[0].has_table);
+        assert!(!toc[0].has_code);
+        assert!(toc[1].has_table);
+        assert!(!toc[1].has_code);
+        assert!(!toc[2].has_table);
+        assert!(toc[2].has_code);
     }
 }

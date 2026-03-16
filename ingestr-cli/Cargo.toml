@@ -1,6 +1,6 @@
 [package]
 name = "ingestr-cli"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -30,3 +30,7 @@ walkdir = "2.5.0"
 time = { version = "0.3.37", features = ["formatting"] }
 ingestr-core = { path = "../ingestr-core" }
 sysinfo = "0.30.13"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+arboard = "3"

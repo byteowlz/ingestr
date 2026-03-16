@@ -1,0 +1,35 @@
+{
+  "todos": [
+    {
+      "id": "fde53aa0",
+      "content": "Progress display on stderr",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "ad15cd3d",
+      "content": "Stream pages to file as they complete",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "0447fbb2",
+      "content": "Parallel VLM with -j flag",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "a0129ec9",
+      "content": "PPTX VLM path updated",
+      "status": "completed",
+      "priority": "high"
+    },
+    {
+      "id": "9e7f3317",
+      "content": "Compile + 48 tests pass + installed",
+      "status": "completed",
+      "priority": "high"
+    }
+  ],
+  "updated_at": "2026-03-12T07:46:09.559Z"
+}
