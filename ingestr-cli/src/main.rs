@@ -1822,7 +1822,9 @@ impl DocumentProcessor {
         let url = vlm.llm_url.clone()
             .filter(|s| !s.is_empty())
             .or_else(|| self.settings.llm_base_url.clone())
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+            .unwrap_or_else(|| "http://localhost:11434".to_string())
+            .trim_end_matches('/')
+            .to_string();
         let model = self.vlm_model.clone()
             .or_else(|| vlm.model.clone())
             .filter(|s| !s.is_empty())
@@ -2289,7 +2291,10 @@ fn call_vlm_api(
                 }
             ]
         }],
-        "max_tokens": 4096
+        "max_tokens": 4096,
+        // Disable thinking/reasoning for models that support it (Qwen3.5, etc.)
+        // This puts the full response in "content" instead of "reasoning"
+        "chat_template_kwargs": {"enable_thinking": false}
     });
 
     info!("VLM request to {}/v1/chat/completions model={}", llm_url, model);
@@ -2310,10 +2315,17 @@ fn call_vlm_api(
     let response_json: serde_json::Value = response.json()
         .context("parsing VLM response")?;
 
-    response_json["choices"][0]["message"]["content"]
+    let message = &response_json["choices"][0]["message"];
+
+    // Try content first, then reasoning (for thinking models like Qwen3.5)
+    let text = message["content"]
         .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("invalid response format from VLM API"))
+        .filter(|s| !s.is_empty())
+        .or_else(|| message["reasoning"].as_str())
+        .or_else(|| message["reasoning_content"].as_str());
+
+    text.map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("no content in VLM response: {}", response_json))
 }
 
 /// Run OCR on a file
