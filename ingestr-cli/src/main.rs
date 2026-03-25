@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, RecvTimeoutError},
 };
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -21,10 +21,12 @@ use ingestr_core::{IndexedDocument, SearchIndex};
 use log::{LevelFilter, debug, error, info, warn};
 use markitdown::{MarkItDown, model::ConversionOptions};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use rten::Model as RtenModel;
 use sysinfo::{Pid, Signal, System};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -268,7 +270,7 @@ struct ConvertCommand {
     #[arg(long)]
     ocr: bool,
     /// OCR backend to use
-    #[arg(long, value_name = "BACKEND", value_enum, default_value = "tesseract")]
+    #[arg(long, value_name = "BACKEND", value_enum, default_value = "ocrs")]
     ocr_backend: OcrBackend,
     /// OCR languages (comma-separated, e.g., "eng,deu")
     #[arg(long, value_name = "LANGS", value_delimiter = ',')]
@@ -342,8 +344,9 @@ impl InputFormat {
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum OcrBackend {
-    #[default]
     Tesseract,
+    #[default]
+    Ocrs,
     Surya,
     Easyocr,
 }
@@ -352,6 +355,7 @@ impl std::fmt::Display for OcrBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OcrBackend::Tesseract => write!(f, "tesseract"),
+            OcrBackend::Ocrs => write!(f, "ocrs"),
             OcrBackend::Surya => write!(f, "surya"),
             OcrBackend::Easyocr => write!(f, "easyocr"),
         }
@@ -416,6 +420,9 @@ impl RuntimeContext {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
 
         builder.filter_level(self.effective_log_level());
+        // lopdf can emit repetitive "corrupt deflate stream" warnings for encrypted/corrupt PDFs.
+        // We handle these cases explicitly and return user-friendly errors, so hide this crate-level noise.
+        builder.filter_module("lopdf", LevelFilter::Error);
 
         let force_color = matches!(self.common.color, ColorOption::Always)
             || env::var_os("FORCE_COLOR").is_some();
@@ -819,7 +826,7 @@ impl Default for VlmConfig {
 struct OcrConfig {
     /// Enable OCR processing
     enabled: bool,
-    /// OCR backend (tesseract, surya, easyocr)
+    /// OCR backend (tesseract, ocrs, surya, easyocr)
     backend: OcrBackend,
     /// Languages for OCR
     languages: Vec<String>,
@@ -829,7 +836,7 @@ impl Default for OcrConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            backend: OcrBackend::Tesseract,
+            backend: OcrBackend::Ocrs,
             languages: vec!["eng".to_string()],
         }
     }
@@ -1731,7 +1738,7 @@ impl DocumentProcessor {
             jobs: 1,
             vlm_output: None,
             ocr_enabled: false,
-            ocr_backend: OcrBackend::Tesseract,
+            ocr_backend: OcrBackend::Ocrs,
             ocr_languages: vec!["eng".to_string()],
         }
     }
@@ -1772,6 +1779,31 @@ impl DocumentProcessor {
         }
         if self.vlm_enabled && is_presentation_extension(&extension) {
             return self.process_pptx_with_vlm(input);
+        }
+
+        // Check for encrypted PDFs before passing to markitdown to avoid panics
+        if is_pdf_extension(&extension) {
+            match is_pdf_encrypted(input) {
+                Ok(true) => {
+                    // Encrypted PDF - try OCR if available, otherwise return error
+                    if self.ocr_enabled {
+                        if let Ok(ocr_result) = self.process_with_ocr(input) {
+                            if !ocr_result.text_content.trim().is_empty() {
+                                return Ok(ocr_result);
+                            }
+                        }
+                    }
+                    bail!(
+                        "PDF is encrypted/password-protected and cannot be converted. \
+                        Consider using --vlm flag to process it via a vision model, \
+                        or --ocr flag to extract text via OCR."
+                    );
+                }
+                Ok(false) => {} // Not encrypted, proceed with markitdown
+                Err(e) => {
+                    warn!("Could not check PDF encryption status: {}, attempting conversion anyway", e);
+                }
+            }
         }
 
         // Try markitdown first
@@ -2231,6 +2263,24 @@ fn is_presentation_extension(ext: &str) -> bool {
     matches!(ext, "pptx" | "ppt" | "odp" | "key")
 }
 
+/// Check if a PDF file is encrypted/password-protected.
+/// Returns true if encrypted, false if not, or an error if the file cannot be read.
+fn is_pdf_encrypted(path: &Path) -> Result<bool> {
+    use lopdf::{Document, Object};
+
+    let doc = Document::load(path)
+        .with_context(|| format!("failed to load PDF: {}", path.display()))?;
+
+    // Check the Encrypt dictionary in trailer
+    if let Ok(encrypt) = doc.trailer.get(b"Encrypt") {
+        if *encrypt != Object::Null {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -2328,10 +2378,290 @@ fn call_vlm_api(
         .ok_or_else(|| anyhow!("no content in VLM response: {}", response_json))
 }
 
+const OCRS_DETECTION_MODEL_URL: &str = "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten";
+const OCRS_RECOGNITION_MODEL_URL: &str = "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten";
+
+fn ocrs_cache_dir() -> Result<PathBuf> {
+    let base_cache = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".cache")
+        });
+
+    let cache_dir = base_cache.join("ocrs");
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("creating OCRS cache dir {}", cache_dir.display()))?;
+    Ok(cache_dir)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn download_to_cache(url: &str, filename: &str) -> Result<PathBuf> {
+    let path = ocrs_cache_dir()?.join(filename);
+    if path.exists() {
+        eprintln!("OCRS model cached: {}", path.display());
+        return Ok(path);
+    }
+
+    info!("downloading OCRS model from {}", url);
+    let mut response = reqwest::blocking::get(url)
+        .with_context(|| format!("downloading model from {}", url))?
+        .error_for_status()
+        .with_context(|| format!("failed to download model from {}", url))?;
+
+    let total = response.content_length();
+    eprintln!(
+        "Downloading OCRS model {}{}",
+        filename,
+        total
+            .map(|t| format!(" ({})", human_bytes(t)))
+            .unwrap_or_default()
+    );
+
+    let mut file = fs::File::create(&path)
+        .with_context(|| format!("creating model file {}", path.display()))?;
+    let mut downloaded: u64 = 0;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut last_print = Instant::now();
+    let started = Instant::now();
+
+    loop {
+        let n = response
+            .read(&mut buffer)
+            .with_context(|| format!("reading model bytes from {}", url))?;
+        if n == 0 {
+            break;
+        }
+
+        file.write_all(&buffer[..n])
+            .with_context(|| format!("writing model to {}", path.display()))?;
+        downloaded += n as u64;
+
+        if last_print.elapsed() >= Duration::from_millis(200) {
+            match total {
+                Some(t) if t > 0 => {
+                    let pct = (downloaded as f64 / t as f64) * 100.0;
+                    eprint!(
+                        "\r  -> {} / {} ({:.1}%)",
+                        human_bytes(downloaded),
+                        human_bytes(t),
+                        pct
+                    );
+                }
+                _ => {
+                    eprint!("\r  -> downloaded {}", human_bytes(downloaded));
+                }
+            }
+            let _ = io::stderr().flush();
+            last_print = Instant::now();
+        }
+    }
+
+    let elapsed = started.elapsed().as_secs_f32();
+    eprintln!(
+        "\r  -> done: {} in {:.1}s         ",
+        human_bytes(downloaded),
+        elapsed
+    );
+
+    Ok(path)
+}
+
+fn run_ocrs_on_image(input: &Path, engine: &OcrEngine, show_progress: bool) -> Result<String> {
+    let started = Instant::now();
+
+    if show_progress {
+        eprintln!("OCRS: loading image {}", input.display());
+    }
+    let image = image::open(input)
+        .with_context(|| format!("reading image for OCRS: {}", input.display()))?
+        .into_rgb8();
+
+    let image_source = ImageSource::from_bytes(image.as_raw(), image.dimensions())
+        .context("creating OCRS image source")?;
+
+    if show_progress {
+        eprintln!("OCRS: preparing input tensor");
+    }
+    let ocr_input = engine.prepare_input(image_source).context("preparing OCRS input")?;
+
+    if show_progress {
+        eprintln!("OCRS: detecting words");
+    }
+    let word_rects = engine.detect_words(&ocr_input).context("OCRS word detection failed")?;
+
+    if show_progress {
+        eprintln!("OCRS: grouping into lines");
+    }
+    let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
+
+    if show_progress {
+        eprintln!("OCRS: recognizing text");
+    }
+    let line_texts = engine
+        .recognize_text(&ocr_input, &line_rects)
+        .context("OCRS text recognition failed")?;
+
+    let text = line_texts
+        .iter()
+        .flatten()
+        .map(|line| line.to_string())
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if show_progress {
+        eprintln!(
+            "OCRS: done in {:.2}s ({} words, {} lines)",
+            started.elapsed().as_secs_f32(),
+            word_rects.len(),
+            line_rects.len()
+        );
+    }
+
+    Ok(text)
+}
+
+fn run_ocrs_on_pdf(input: &Path, engine: &OcrEngine) -> Result<String> {
+    let temp_dir = std::env::temp_dir().join(format!("ingestr-ocrs-pdf-{}", std::process::id()));
+    if temp_dir.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("creating temp dir {}", temp_dir.display()))?;
+
+    let result = (|| -> Result<String> {
+        eprint!("OCRS: rendering PDF pages...");
+        let render_started = Instant::now();
+        let status = ProcCommand::new("pdftoppm")
+            .args(["-png", "-r", "200"])
+            .arg(input)
+            .arg(temp_dir.join("page"))
+            .status()
+            .context("running pdftoppm (is poppler installed?)")?;
+
+        if !status.success() {
+            bail!("pdftoppm failed with status {}", status);
+        }
+
+        let mut page_images: Vec<PathBuf> = fs::read_dir(&temp_dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+            .collect();
+        page_images.sort();
+
+        if page_images.is_empty() {
+            bail!("pdftoppm produced no page images");
+        }
+
+        let total = page_images.len();
+        eprintln!(" {} pages in {:.1}s", total, render_started.elapsed().as_secs_f32());
+
+        let mut sections = Vec::with_capacity(total);
+        let pipeline_started = Instant::now();
+
+        for (idx, page) in page_images.iter().enumerate() {
+            let page_idx = idx + 1;
+            let page_started = Instant::now();
+            let page_text = run_ocrs_on_image(page, engine, false)
+                .with_context(|| format!("OCRS failed on PDF page {}", page_idx))?;
+            sections.push(format!("## Page {}\n\n{}", page_idx, page_text));
+
+            let done = page_idx;
+            let avg = pipeline_started.elapsed().as_secs_f32() / done as f32;
+            let remaining_pages = total.saturating_sub(done);
+            let eta = avg * remaining_pages as f32;
+            eprintln!(
+                "OCRS PDF: [{}/{}] page {} done ({:.2}s page, {:.2}s avg, ~{:.0}s remaining)",
+                done,
+                total,
+                page_idx,
+                page_started.elapsed().as_secs_f32(),
+                avg,
+                eta
+            );
+        }
+
+        eprintln!(
+            "OCRS PDF: completed {} pages in {:.1}s",
+            total,
+            pipeline_started.elapsed().as_secs_f32()
+        );
+
+        Ok(sections.join("\n\n"))
+    })();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    result
+}
+
+fn run_ocrs(input: &Path, languages: &[String]) -> Result<String> {
+    if !languages.is_empty() && languages.iter().all(|l| l != "eng") {
+        warn!(
+            "ocrs backend currently works best for Latin/English; requested languages: {:?}",
+            languages
+        );
+    }
+
+    let init_started = Instant::now();
+    eprintln!("OCRS: preparing models");
+    let detection_model_path = download_to_cache(OCRS_DETECTION_MODEL_URL, "text-detection.rten")?;
+    let recognition_model_path =
+        download_to_cache(OCRS_RECOGNITION_MODEL_URL, "text-recognition.rten")?;
+
+    eprintln!("OCRS: loading detection model {}",&detection_model_path.display());
+    let detection_model =
+        RtenModel::load_file(&detection_model_path).context("loading OCRS detection model")?;
+
+    eprintln!("OCRS: loading recognition model {}",&recognition_model_path.display());
+    let recognition_model =
+        RtenModel::load_file(&recognition_model_path).context("loading OCRS recognition model")?;
+
+    let engine = OcrEngine::new(OcrEngineParams {
+        detection_model: Some(detection_model),
+        recognition_model: Some(recognition_model),
+        ..Default::default()
+    })
+    .context("initializing OCRS engine")?;
+    eprintln!("OCRS: models ready in {:.2}s", init_started.elapsed().as_secs_f32());
+
+    if input
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+    {
+        run_ocrs_on_pdf(input, &engine)
+    } else {
+        run_ocrs_on_image(input, &engine, true)
+    }
+}
+
 /// Run OCR on a file
 fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -> Result<String> {
     let lang_arg = languages.join("+");
-    
+
     match backend {
         OcrBackend::Tesseract => {
             let output = ProcCommand::new("tesseract")
@@ -2349,6 +2679,7 @@ fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -> Result<St
 
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
+        OcrBackend::Ocrs => run_ocrs(input, languages),
         OcrBackend::Surya => {
             // Surya uses Python, call via python
             let output = ProcCommand::new("surya_ocr")
@@ -2372,7 +2703,7 @@ fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -> Result<St
                 lang_arg.replace("+", "','"),
                 input.display()
             );
-            
+
             let output = ProcCommand::new("python3")
                 .arg("-c")
                 .arg(&script)
@@ -3801,6 +4132,7 @@ mod tests {
     #[test]
     fn ocr_backend_display() {
         assert_eq!(OcrBackend::Tesseract.to_string(), "tesseract");
+        assert_eq!(OcrBackend::Ocrs.to_string(), "ocrs");
         assert_eq!(OcrBackend::Surya.to_string(), "surya");
         assert_eq!(OcrBackend::Easyocr.to_string(), "easyocr");
     }
@@ -3826,7 +4158,7 @@ mod tests {
     fn ocr_config_default() {
         let config = OcrConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.backend, OcrBackend::Tesseract);
+        assert_eq!(config.backend, OcrBackend::Ocrs);
         assert_eq!(config.languages, vec!["eng"]);
     }
 
