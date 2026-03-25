@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.1] - 2026-03-25
+
+### Added
+
+- **Native Rust OCR backend (`ocrs`)**: Added `--ocr-backend ocrs` to run OCR using the Rust-native `ocrs` engine. Default `ocrs` models are auto-downloaded on first use and cached in the XDG cache directory (`$XDG_CACHE_HOME/ocrs` or `~/.cache/ocrs`).
+- **OCRS PDF support**: `ocrs` backend now handles PDFs by rendering pages via `pdftoppm` and running OCR page-by-page, similar to the VLM PDF path.
+- **Detailed OCR progress display**: Added verbose OCR progress on stderr, including model preparation/loading, page-by-page PDF OCR progress with ETA, and model download progress (bytes/percent) when models are fetched.
+
+### Changed
+
+- **OCR default backend**: `ocrs` is now the default OCR backend for CLI and config defaults. You can still override with `--ocr-backend tesseract|surya|easyocr`.
+
+### Fixed
+
+- **Encrypted PDF handling**: Fixed panic when converting encrypted/password-protected PDFs. The tool now detects encrypted PDFs and returns a clear error message suggesting to use `--vlm` or `--ocr` flags instead of crashing with `PdfError(Decryption(InvalidKeyLength))`.
+- **Cleaner CLI output for problematic PDFs**: Suppressed noisy `lopdf` "corrupt deflate stream" warnings in normal output so users see actionable errors instead of repetitive parser warnings.
+
 ## [0.3.0] - 2026-03-12
 
 ### Added
