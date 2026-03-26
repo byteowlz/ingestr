@@ -2,6 +2,7 @@
 
 ## Closed
 
+- [ingestr-2kkj] Add GitHub release workflow for ingestr binaries (linux amd64+arm64) (closed 2026-03-26)
 - [ingestr-5a7e] Make convert the default subcommand (closed 2026-03-11)
 - [ingestr-vfz7] Conversion cache (closed 2026-03-11)
 - [ingestr-a6nx] Clipboard support: --clipboard flag (closed 2026-03-11)
