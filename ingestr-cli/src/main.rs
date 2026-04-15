@@ -239,7 +239,9 @@ struct SearchCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ConvertCommand {
-    /// File, directory, or URL to convert (use '-' or omit for stdin). Use ":pptx" to convert all PowerPoint files in current directory recursively.
+    /// File, directory, or URL to convert (use '-' or omit for stdin).
+    /// Use ":EXT" pattern (e.g., ":pptx", ":pdf", ":docx") to batch convert all
+    /// files with that extension recursively in the current directory.
     #[arg(value_name = "INPUT")]
     input: Option<String>,
     /// Write output to a file or directory instead of stdout. When converting
@@ -2754,11 +2756,12 @@ fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
     let input_str = cmd.input.as_ref().unwrap().clone();
 
     // Special patterns for batch conversion:
-    // ":pptx" -> find all .pptx files in current directory recursively and convert in-place
+    // ":EXT" -> find all .EXT files in current directory recursively and convert in-place
+    // Examples: ":pptx" for PowerPoints, ":pdf" for PDFs, ":docx" for Word files, etc.
     if input_str.starts_with(':') {
         let ext = &input_str[1..]; // remove the leading ':'
         if ext.is_empty() {
-            bail!("special pattern ":EXT" requires an extension, e.g., ":pptx"");
+            bail!("special pattern ":EXT" requires an extension, e.g., ":pptx", ":pdf", ":docx"");
         }
         let cmd = ConvertCommand {
             extensions: Some(vec![ext.to_string()]),
