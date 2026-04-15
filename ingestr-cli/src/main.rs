@@ -239,11 +239,13 @@ struct SearchCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ConvertCommand {
-    /// File, directory, or URL to convert (use '-' or omit for stdin).
-    /// Use ":EXT" pattern (e.g., ":pptx", ":pdf", ":docx") to batch convert all
-    /// files with that extension recursively in the current directory.
+    /// File, directory, or URL to convert (use '-' or omit for stdin)
     #[arg(value_name = "INPUT")]
     input: Option<String>,
+    /// Batch convert all files with given extension in current directory (recursive)
+    /// Example: --batch pptx converts all .pptx files to .md alongside sources
+    #[arg(long, value_name = "EXT")]
+    batch: Option<String>,
     /// Write output to a file or directory instead of stdout. When converting
     /// a directory and no output is specified, writes .md files alongside sources.
     #[arg(short, long, value_name = "PATH")]
@@ -2753,24 +2755,23 @@ fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
         return handle_convert_stdin(ctx, &cmd, &settings);
     }
 
-    let input_str = cmd.input.as_ref().unwrap().clone();
-
-    // Special patterns for batch conversion:
-    // ":EXT" -> find all .EXT files in current directory recursively and convert in-place
-    // Examples: ":pptx" for PowerPoints, ":pdf" for PDFs, ":docx" for Word files, etc.
-    if input_str.starts_with(':') {
-        let ext = &input_str[1..]; // remove the leading ':'
+    // Handle batch conversion flag: --batch EXT
+    if let Some(ref batch_ext) = cmd.batch {
+        let ext = batch_ext.trim_start_matches('.'); // Allow "pptx" or ".pptx"
         if ext.is_empty() {
-            bail!("special pattern ":EXT" requires an extension, e.g., ":pptx", ":pdf", ":docx"");
+            bail!("--batch requires a file extension, e.g., --batch pptx");
         }
         let cmd = ConvertCommand {
             extensions: Some(vec![ext.to_string()]),
             recursive: true,
             in_place: true,
+            input: Some(".".to_string()), // Use current directory as base
             ..cmd
         };
         return handle_convert_directory(ctx, &cmd, &settings, &env::current_dir()?);
     }
+
+    let input_str = cmd.input.as_ref().unwrap().clone();
 
     // URL input
     if is_url(&input_str) {
