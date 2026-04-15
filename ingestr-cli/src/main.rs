@@ -239,10 +239,11 @@ struct SearchCommand {
 
 #[derive(Debug, Clone, Args)]
 struct ConvertCommand {
-    /// File, directory, or URL to convert (use '-' or omit for stdin)
+    /// File, directory, or URL to convert (use '-' or omit for stdin). Use ":pptx" to convert all PowerPoint files in current directory recursively.
     #[arg(value_name = "INPUT")]
     input: Option<String>,
-    /// Write output to a file or directory instead of stdout
+    /// Write output to a file or directory instead of stdout. When converting
+    /// a directory and no output is specified, writes .md files alongside sources.
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
     /// Input format hint when reading from stdin
@@ -254,6 +255,10 @@ struct ConvertCommand {
     /// File extensions to process (comma-separated, e.g., "pdf,docx,html")
     #[arg(long, value_name = "EXTENSIONS", value_delimiter = ',')]
     extensions: Option<Vec<String>>,
+    /// Write output files alongside source files (same directory) when processing
+    /// directories. This is the default when no --output is specified.
+    #[arg(long)]
+    in_place: bool,
     /// Enable VLM processing for images
     #[arg(long)]
     vlm: bool,
@@ -2748,6 +2753,22 @@ fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
 
     let input_str = cmd.input.as_ref().unwrap().clone();
 
+    // Special patterns for batch conversion:
+    // ":pptx" -> find all .pptx files in current directory recursively and convert in-place
+    if input_str.starts_with(':') {
+        let ext = &input_str[1..]; // remove the leading ':'
+        if ext.is_empty() {
+            bail!("special pattern ":EXT" requires an extension, e.g., ":pptx"");
+        }
+        let cmd = ConvertCommand {
+            extensions: Some(vec![ext.to_string()]),
+            recursive: true,
+            in_place: true,
+            ..cmd
+        };
+        return handle_convert_directory(ctx, &cmd, &settings, &env::current_dir()?);
+    }
+
     // URL input
     if is_url(&input_str) {
         let temp_path = fetch_url(&input_str)?;
@@ -3017,6 +3038,9 @@ fn handle_convert_directory(
         .transpose()
         .context("expanding output path")?;
 
+    // Determine if we should write alongside source files
+    let in_place = cmd.in_place || (output_dir.is_none() && !ctx.common.dry_run);
+
     // Collect files to process
     let walker = if cmd.recursive {
         WalkDir::new(input_dir)
@@ -3061,12 +3085,18 @@ fn handle_convert_directory(
     }
 
     let total = files.len();
-    info!("found {} files to convert", total);
+    if !ctx.common.quiet {
+        println!("Found {} files to convert", total);
+    }
 
     if ctx.common.dry_run {
         for file in &files {
-            let relative = file.strip_prefix(input_dir).unwrap_or(file);
-            let output_path = if let Some(ref out_dir) = output_dir {
+            let output_path = if in_place {
+                let mut out = file.to_path_buf();
+                out.set_extension("md");
+                out.display().to_string()
+            } else if let Some(ref out_dir) = output_dir {
+                let relative = file.strip_prefix(input_dir).unwrap_or(file);
                 let mut out = out_dir.join(relative);
                 out.set_extension("md");
                 out.display().to_string()
@@ -3085,6 +3115,10 @@ fn handle_convert_directory(
             .unwrap_or(1)
     });
 
+    // Single-threaded mode gets interactive progress
+    let show_progress = parallel == 1 && !ctx.common.quiet && !ctx.common.no_progress;
+    let progress_counter = AtomicUsize::new(0);
+
     let converted = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -3102,6 +3136,7 @@ fn handle_convert_directory(
                         output_dir.as_ref(),
                         settings,
                         cmd,
+                        in_place,
                         &converted,
                         &failed,
                         &errors,
@@ -3109,17 +3144,38 @@ fn handle_convert_directory(
                 }).collect()
             })
     } else {
-        files.iter().map(|file| {
-            process_file_for_batch(
+        files.iter().enumerate().map(|(idx, file)| {
+            // Show progress before processing
+            if show_progress {
+                let num = idx + 1;
+                let file_name = file.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                eprint!("\r\x1b[K[{}/{}] Converting {}...", num, total, file_name);
+                let _ = io::stderr().flush();
+            }
+
+            let result = process_file_for_batch(
                 file,
                 input_dir,
                 output_dir.as_ref(),
                 settings,
                 cmd,
+                in_place,
                 &converted,
                 &failed,
                 &errors,
-            )
+            );
+
+            // Show result indicator
+            if show_progress {
+                match &result {
+                    Ok(_) => eprint!(" ✓"),
+                    Err(_) => eprint!(" ✗"),
+                }
+            }
+
+            result
         }).collect()
     };
 
@@ -3147,6 +3203,10 @@ fn handle_convert_directory(
         });
         println!("{}", serde_yaml::to_string(&output)?);
     } else {
+        // Add newline after progress indicator if used
+        if show_progress {
+            eprintln!();
+        }
         println!("\nConversion complete:");
         println!("  Total files: {}", stats.total);
         println!("  Converted:   {}", stats.converted);
@@ -3169,6 +3229,7 @@ fn process_file_for_batch(
     output_dir: Option<&PathBuf>,
     settings: &ServiceSettings,
     cmd: &ConvertCommand,
+    in_place: bool,
     converted: &AtomicUsize,
     failed: &AtomicUsize,
     errors: &std::sync::Mutex<Vec<String>>,
@@ -3179,8 +3240,13 @@ fn process_file_for_batch(
 
     match processor.process(file) {
         Ok(doc) => {
-            let relative = file.strip_prefix(input_dir).unwrap_or(file);
-            let output_path = if let Some(out_dir) = output_dir {
+            // Determine output path: in-place (source dir), output dir, or stdout
+            let output_path = if in_place {
+                let mut out = file.to_path_buf();
+                out.set_extension("md");
+                out
+            } else if let Some(out_dir) = output_dir {
+                let relative = file.strip_prefix(input_dir).unwrap_or(file);
                 let mut out = out_dir.join(relative);
                 out.set_extension("md");
                 out
@@ -3218,8 +3284,8 @@ fn process_file_for_batch(
                 content
             };
 
-            // Write output file if output_dir is specified
-            if output_dir.is_some() {
+            // Write output file if in_place or output_dir is specified
+            if in_place || output_dir.is_some() {
                 if let Some(parent) = output_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
