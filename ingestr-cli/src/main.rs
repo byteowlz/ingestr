@@ -1,8 +1,10 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcCommand, Stdio};
 use std::sync::{
@@ -1082,6 +1084,38 @@ struct ConvertedDocument {
     already_written: bool,
 }
 
+fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => message.to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
+fn safe_markitdown_convert<T, E, F>(context: &str, convert: F) -> Option<T>
+where
+    F: FnOnce() -> std::result::Result<Option<T>, E>,
+    E: fmt::Display,
+{
+    match catch_unwind(AssertUnwindSafe(convert)) {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
+            warn!("markitdown failed while {}: {}", context, err);
+            None
+        }
+        Err(payload) => {
+            warn!(
+                "markitdown panicked while {}: {}",
+                context,
+                panic_payload_to_string(payload)
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 fn convert_single_file(
     markitdown: &MarkItDown,
@@ -1092,7 +1126,10 @@ fn convert_single_file(
         .to_str()
         .ok_or_else(|| anyhow!("invalid path encoding for {}", input.display()))?;
 
-    if let Some(converted) = markitdown.convert(path_str, conversion_opts) {
+    let context = format!("converting {}", input.display());
+    if let Some(converted) = safe_markitdown_convert(&context, || {
+        markitdown.convert(path_str, conversion_opts)
+    }) {
         return Ok(ConvertedDocument {
             title: converted.title,
             text_content: converted.text_content,
@@ -1817,10 +1854,14 @@ impl DocumentProcessor {
 
         // Try markitdown first
         let conversion_opts = self.build_conversion_options();
-        match self.markitdown.convert(
-            input.to_str().ok_or_else(|| anyhow!("invalid path encoding"))?,
-            conversion_opts,
-        ) {
+        let path_str = input
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid path encoding"))?;
+        let context = format!("converting {}", input.display());
+
+        match safe_markitdown_convert(&context, || {
+            self.markitdown.convert(path_str, conversion_opts)
+        }) {
             Some(result) if !result.text_content.trim().is_empty() => {
                 return Ok(ConvertedDocument {
                     title: result.title,
@@ -3121,7 +3162,6 @@ fn handle_convert_directory(
 
     // Single-threaded mode gets interactive progress
     let show_progress = parallel == 1 && !ctx.common.quiet && !ctx.common.no_progress;
-    let progress_counter = AtomicUsize::new(0);
 
     let converted = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
@@ -3777,14 +3817,16 @@ impl ConversionService {
             None
         };
 
-        let converted = match self.markitdown.convert(
-            path.to_str()
-                .ok_or_else(|| anyhow!("invalid path encoding for {}", path.display()))?,
-            conversion_opts,
-        ) {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid path encoding for {}", path.display()))?;
+        let context = format!("converting {}", path.display());
+        let converted = match safe_markitdown_convert(&context, || {
+            self.markitdown.convert(path_str, conversion_opts)
+        }) {
             Some(result) => result,
             None => {
-                warn!("no converter available for {}", path.display());
+                warn!("no converter available or converter failed for {}", path.display());
                 return Ok(());
             }
         };

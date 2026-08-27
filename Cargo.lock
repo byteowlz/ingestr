@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "ingestr-cli"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2364,9 +2364,9 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
 name = "markitdown"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f9f839942474a5d3702628d357fbfd1a243138b7a11f800a58983fabecac1bd"
+checksum = "e5502fd26b472f92ad779220198a8feac7c04c7db0cf2a533614f7616ff3d9a0"
 dependencies = [
  "base64 0.22.1",
  "calamine",
