@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevented conversion crashes when `markitdown` panics on malformed/misdetected inputs (for example, `ParseError(NoFeedRoot)` in RSS parsing while converting non-RSS files). `ingestr` now catches converter panics, logs a warning, and continues with fallback handling instead of aborting the process.
+- Updated `markitdown` from `0.1.10` to `0.1.11` for upstream converter fixes.
+
 ## [0.3.1] - 2026-03-25
 
 ### Added

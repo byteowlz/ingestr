@@ -16,7 +16,7 @@ ctrlc = "3.4.5"
 dirs = "5.0.1"
 env_logger = "0.11.5"
 log = "0.4.22"
-markitdown = "0.1.10"
+markitdown = "0.1.11"
 notify = "8.0.0"
 rayon = "1.10"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
