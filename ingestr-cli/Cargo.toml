@@ -43,6 +43,7 @@ arboard.workspace = true
 lopdf.workspace = true
 ocrs.workspace = true
 rten.workspace = true
+pdf-inspector.workspace = true
 image.workspace = true
 
 [lints]

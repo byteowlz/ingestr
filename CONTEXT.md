@@ -134,3 +134,11 @@ _Avoid_: outline
 The structured output of a one-shot conversion (`ConvertResult`), including
 source/output paths, frontmatter, and stats; used for `--json` output.
 _Avoid_: response
+
+**Page-aware Routing**:
+The process of classifying each PDF page (text/vector vs scanned) and routing
+text pages to native Markdown extraction while sending only scanned pages to
+OCR. Keeps scanned pages from being silently dropped in mixed PDFs and avoids
+OCR-ing text pages. Configured under `[processors.ocr]` (`page_routing`,
+`page_dpi`).
+_Avoid_: routing (ambiguous with file-type routing)
