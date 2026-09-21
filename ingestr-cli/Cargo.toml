@@ -1,40 +1,49 @@
 [package]
 name = "ingestr-cli"
-version = "0.3.5"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+description = "Watch, convert, and index documents to Markdown with full-text search"
+keywords = ["document", "conversion", "markdown", "ocr", "search"]
+categories = ["command-line-utilities", "text-processing"]
 
 [[bin]]
 name = "ingestr"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.95"
-clap = { version = "4.5.49", features = ["derive", "env"] }
-clap_complete = "4.5.23"
-config = { version = "0.15.18", features = ["toml"] }
-ctrlc = "3.4.5"
-dirs = "5.0.1"
-env_logger = "0.11.5"
-log = "0.4.22"
-markitdown = "0.1.11"
-notify = "8.0.0"
-rayon = "1.10"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-tantivy = "0.22.0"
-shellexpand = "3.1.0"
-serde_yaml = "0.9.34"
-toml = "0.8.19"
-walkdir = "2.5.0"
-time = { version = "0.3.37", features = ["formatting"] }
-ingestr-core = { path = "../ingestr-core" }
-sysinfo = "0.30.13"
-sha2 = "0.10"
-hex = "0.4"
-regex = "1"
-arboard = "3"
-lopdf = "0.35"
-ocrs = "0.12.1"
-rten = "0.24.0"
-image = "0.25"
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+config.workspace = true
+ctrlc.workspace = true
+dirs.workspace = true
+env_logger.workspace = true
+log.workspace = true
+markitdown.workspace = true
+notify.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tantivy.workspace = true
+shellexpand.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+time.workspace = true
+ingestr-core.workspace = true
+sysinfo.workspace = true
+sha2.workspace = true
+hex.workspace = true
+regex.workspace = true
+arboard.workspace = true
+lopdf.workspace = true
+ocrs.workspace = true
+rten.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

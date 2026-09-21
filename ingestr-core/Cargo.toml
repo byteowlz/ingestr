@@ -1,9 +1,19 @@
 [package]
 name = "ingestr-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+description = "Core indexing types and full-text search over converted documents"
+keywords = ["document", "index", "search", "tantivy"]
+categories = ["text-processing"]
 
 [dependencies]
-anyhow = "1.0.95"
-serde = { version = "1.0.228", features = ["derive"] }
-tantivy = "0.22.0"
+anyhow.workspace = true
+serde.workspace = true
+tantivy.workspace = true
+
+[lints]
+workspace = true

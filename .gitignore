@@ -1,1 +1,45 @@
+.pi/todos/
 /target
+.env 
+.DS_Store
+.vscode/
+
+# Byteowlz release artifacts
+/release/
+*.tar.gz
+checksums.txt
+
+# Downloaded OCR/VLM model weights (kept out of VCS; fetched into XDG cache)
+*.gguf
+*.rten
+
+# === rust ===
+**/*.rs.bk
+Cargo.lock.bak
+
+# === linux ===
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# === macos ===
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# === editors ===
+.cargo/
+!.cargo/config.toml
+.idea/
+.vscode/

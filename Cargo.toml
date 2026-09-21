@@ -1,3 +1,133 @@
 [workspace]
 members = ["ingestr-cli", "ingestr-core", "ingestr-mcp"]
 resolver = "3"
+
+[workspace.package]
+version = "0.3.5"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/byteowlz/ingestr"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.49", features = ["derive", "env"] }
+clap_complete = "4.5.23"
+config = { version = "0.15.18", default-features = false, features = ["json", "toml"] }
+ctrlc = "3.4.5"
+dirs = "5.0.1"
+env_logger = "0.11.5"
+log = "0.4.22"
+markitdown = "0.1.11"
+notify = "8.0.0"
+rayon = "1.10"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tantivy = "0.22.0"
+shellexpand = "3.1.0"
+toml = "0.8.19"
+walkdir = "2.5.0"
+time = { version = "0.3.37", features = ["formatting"] }
+sysinfo = "0.30.13"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+arboard = "3"
+lopdf = "0.35"
+ocrs = "0.12.1"
+rten = "0.24.0"
+image = "0.25"
+tempfile = "3"
+ingestr-core = { path = "ingestr-core" }
+
+# ============================================
+# MAXIMUM PRESET - rust-magic-linter
+# ============================================
+# Everything at deny level - maximum strictness
+# https://github.com/vicnaum/rust-magic-linter
+
+[workspace.lints.rust]
+# Safety - forbid means even #![allow(...)] can't override
+unsafe_code = "forbid"
+non_ascii_idents = "forbid"
+
+# Quality enforcement
+warnings = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+
+# Documentation enforcement
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+missing_copy_implementations = "deny"
+unfulfilled_lint_expectations = "deny"
+
+[workspace.lints.rustdoc]
+all = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+# Guardrails (anti-AI-slop): these are the lint set that catches the mistakes
+# AI-generated code most often introduces. Aligned with the posture the mature
+# byteowlz codebase (oqto) enforces: correctness/perf at deny for the guardrails,
+# with a curated set rather than a blanket pedantic/nursery deny.
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+allow_attributes_without_reason = "deny"
+
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# === ASYNC SAFETY ===
+await_holding_lock = "deny"
+large_futures = "deny"
+
+# === PROCESS/MEMORY SAFETY ===
+exit = "deny"
+mem_forget = "deny"
+
+# === PERFORMANCE ===
+large_stack_arrays = "deny"
+large_types_passed_by_value = "deny"
+
+# === STYLE / CORRECTNESS (curated, warn-level like oqto) ===
+collapsible_if = "warn"
+collapsible_else_if = "warn"
+needless_return = "warn"
+needless_borrow = "warn"
+clone_on_copy = "warn"
+single_char_add_str = "warn"
+manual_strip = "warn"
+manual_flatten = "warn"
+unnecessary_lazy_evaluations = "warn"
+unnecessary_map_or = "warn"
+io_other_error = "warn"
+single_match = "warn"
+cloned_instead_of_copied = "warn"
+inefficient_to_string = "warn"
+ptr_arg = "warn"
+derivable_impls = "warn"
+
+# === INTENTIONALLY ALLOWED (matches oqto; avoid churn on mature code) ===
+too_many_arguments = "allow"
+type_complexity = "allow"
+module_inception = "allow"
+multiple_crate_versions = "allow"
+struct_field_names = "allow"
+needless_pass_by_value = "allow"
+needless_pass_by_ref_mut = "allow"
+needless_borrows_for_generic_args = "allow"
+cognitive_complexity = "allow"   # Enforced via clippy.toml cognitive-complexity-threshold
+print_stdout = "allow"           # CLIs/TUIs/APIs need to print to stdout
+print_stderr = "allow"           # CLIs/TUIs/APIs need to print to stderr
+struct_excessive_bools = "allow" # CLI flag structs have many bools
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"

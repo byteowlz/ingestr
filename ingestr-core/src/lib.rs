@@ -1,5 +1,12 @@
+//! Core indexing types and full-text search over converted documents.
+//!
+//! This crate owns the [`tantivy`]-backed index schema and the read/write
+//! [`SearchIndex`] handle. Everything document-conversion or MCP-specific lives
+//! in the sibling `ingestr-cli` / `ingestr-mcp` crates.
+
 use anyhow::Result;
 use serde::Serialize;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use tantivy::{
@@ -10,24 +17,40 @@ use tantivy::{
     schema::{STORED, STRING, Schema, SchemaBuilder, TEXT, TantivyDocument, Value},
 };
 
+/// A single document queued for indexing.
 #[derive(Debug, Serialize, Clone)]
 pub struct IndexedDocument {
+    /// Absolute path of the source (input) file.
     pub source_path: String,
+    /// Absolute path of the converted Markdown output file.
     pub output_path: String,
+    /// Optional document title extracted at conversion time.
     pub title: Option<String>,
+    /// The full converted Markdown/text content.
     pub content: String,
+    /// RFC 3339 timestamp of when the conversion happened.
     pub converted_at: Option<String>,
 }
 
+/// A single search result returned by [`SearchIndex::search`].
 #[derive(Debug, Serialize, Clone)]
 pub struct SearchHit {
+    /// Tantivy relevance score for this hit.
     pub score: f32,
+    /// Absolute path of the source (input) file.
     pub source_path: String,
+    /// Absolute path of the converted Markdown output file.
     pub output_path: String,
+    /// Optional document title.
     pub title: Option<String>,
+    /// RFC 3339 timestamp of the conversion.
     pub converted_at: Option<String>,
 }
 
+/// A searchable tantivy index over converted documents.
+///
+/// An instance is either writable (holds a writer for ingestion) or read-only
+/// (opens a reader for searching), never both.
 pub struct SearchIndex {
     index: Index,
     reader: Option<IndexReader>,
@@ -35,6 +58,19 @@ pub struct SearchIndex {
     fields: IndexFields,
 }
 
+impl fmt::Debug for SearchIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // tantivy's reader/writer do not implement Debug; report presence only.
+        f.debug_struct("SearchIndex")
+            .field("index", &self.index)
+            .field("writable", &self.writer.is_some())
+            .field("has_reader", &self.reader.is_some())
+            .field("fields", &self.fields)
+            .finish()
+    }
+}
+
+/// Field handles resolved from the index schema.
 #[derive(Debug, Clone)]
 struct IndexFields {
     source_path: tantivy::schema::Field,
@@ -45,11 +81,20 @@ struct IndexFields {
 }
 
 impl SearchIndex {
+    /// Opens (or creates) the index at `path`.
+    ///
+    /// When `writable` is `true` an index writer is created for ingestion;
+    /// otherwise the handle is opened read-only with a searcher reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created, the mmap directory
+    /// cannot be opened, or the index cannot be opened/created.
     pub fn open(path: &Path, writable: bool) -> Result<Self> {
         fs::create_dir_all(path)?;
         let schema = build_schema();
         let directory = MmapDirectory::open(path)?;
-        let index = Index::open_or_create(directory, schema.clone())?;
+        let index = Index::open_or_create(directory, schema)?;
         let schema = index.schema();
         let fields = IndexFields {
             source_path: schema.get_field("source_path")?,
@@ -84,6 +129,17 @@ impl SearchIndex {
         })
     }
 
+    /// Indexes (or replaces) a single document.
+    ///
+    /// Documents with the same `output_path` are de-duplicated: an existing
+    /// document with that key is deleted before the new one is added.
+    ///
+    /// No-op when this handle was opened read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tantivy writer cannot delete or add
+    /// the document.
     pub fn index_document(&mut self, doc: &IndexedDocument) -> Result<()> {
         let Some(writer) = self.writer.as_mut() else {
             return Ok(());
@@ -108,6 +164,11 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Commits pending writes and reloads the searcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer commit or the reader reload fails.
     pub fn commit(&mut self) -> Result<()> {
         if let Some(writer) = self.writer.as_mut() {
             writer.commit()?;
@@ -119,6 +180,15 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Runs a full-text query and returns the top `limit` hits.
+    ///
+    /// The reader is created lazily on first search if this handle was opened
+    /// writable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails to parse or the search/index access
+    /// fails.
     pub fn search(&mut self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         if self.reader.is_none() {
             self.reader = Some(
@@ -132,7 +202,7 @@ impl SearchIndex {
         let reader = self
             .reader
             .as_ref()
-            .expect("reader present after initialization");
+            .ok_or_else(|| anyhow::anyhow!("search index reader not initialized"))?;
         reader.reload()?;
         let searcher = reader.searcher();
 
@@ -183,6 +253,7 @@ impl SearchIndex {
     }
 }
 
+/// Builds the tantivy index schema used across the workspace.
 fn build_schema() -> Schema {
     let mut builder = SchemaBuilder::new();
     builder.add_text_field("source_path", STRING | STORED);

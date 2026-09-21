@@ -1,23 +1,33 @@
 [package]
 name = "ingestr-mcp"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+description = "Model Context Protocol server exposing ingestr full-text search"
+keywords = ["document", "search", "mcp", "llm"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
-anyhow = "1.0.95"
-clap = { version = "4.5.49", features = ["derive"] }
-config = { version = "0.15.18", features = ["toml"] }
-dirs = "5.0.1"
-env_logger = "0.11.5"
-log = "0.4.22"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-shellexpand = "3.1.0"
-tantivy = "0.22.0"
-time = { version = "0.3.37", features = ["formatting"] }
-toml = "0.8.19"
-ingestr-core = { path = "../ingestr-core" }
-sysinfo = "0.30.13"
+anyhow.workspace = true
+clap.workspace = true
+config.workspace = true
+dirs.workspace = true
+env_logger.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shellexpand.workspace = true
+tantivy.workspace = true
+time.workspace = true
+toml.workspace = true
+ingestr-core.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
+
+[lints]
+workspace = true
