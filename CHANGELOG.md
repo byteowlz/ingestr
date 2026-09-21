@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Page-aware PDF routing (Tier 0/1)**: When OCR is enabled on a PDF, `ingestr` now classifies each page via `pdf-inspector` and routes text/vector pages to native Markdown extraction (CPU, no model) while only OCR-ing scanned/image-only pages. This avoids OCR-ing text pages and stops silently dropping scanned pages from mixed PDFs. Controlled by `[processors.ocr]` `page_routing` (default `true`) and `page_dpi` (default `300`).
+
 ### Changed
 
 - **Conformance to byteowlz standards**: Added `CONTEXT.md`, `docs/adr/` (template + README), `clippy.toml`, `.ast-grep/rules/`, and `scripts/drift-check.sh`; rewrote `AGENTS.md` with source-of-truth, strict-lint, and JSON/TOML-only guidance; added workspace lints and the full `just check-all` gate.

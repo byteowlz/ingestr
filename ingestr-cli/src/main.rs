@@ -27,6 +27,7 @@ use log::{LevelFilter, debug, error, info, warn};
 use markitdown::{MarkItDown, model::ConversionOptions};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
+use pdf_inspector::extract_pages_markdown;
 use rayon::prelude::*;
 use regex::Regex;
 use rten::Model as RtenModel;
@@ -886,6 +887,11 @@ struct OcrConfig {
     backend: OcrBackend,
     /// Languages for OCR
     languages: Vec<String>,
+    /// Page-aware PDF routing: extract text pages natively and OCR only the
+    /// scanned pages. Disable to force whole-document OCR for PDFs.
+    page_routing: bool,
+    /// Render DPI used when OCR-ing a scanned PDF page.
+    page_dpi: u32,
 }
 
 impl Default for OcrConfig {
@@ -894,6 +900,8 @@ impl Default for OcrConfig {
             enabled: false,
             backend: OcrBackend::Ocrs,
             languages: vec!["eng".to_string()],
+            page_routing: true,
+            page_dpi: 300,
         }
     }
 }
@@ -1825,6 +1833,10 @@ struct DocumentProcessor {
     ocr_enabled: bool,
     ocr_backend: OcrBackend,
     ocr_languages: Vec<String>,
+    /// Page-aware PDF routing (native text pages + OCR only for scanned pages).
+    ocr_page_routing: bool,
+    /// Render DPI for OCR-ing scanned PDF pages.
+    ocr_page_dpi: u32,
 }
 
 impl DocumentProcessor {
@@ -1840,6 +1852,8 @@ impl DocumentProcessor {
             ocr_enabled: false,
             ocr_backend: OcrBackend::Ocrs,
             ocr_languages: vec!["eng".to_string()],
+            ocr_page_routing: true,
+            ocr_page_dpi: 300,
         }
     }
 
@@ -1873,6 +1887,8 @@ impl DocumentProcessor {
         }
         self.ocr_languages =
             languages.unwrap_or_else(|| self.settings.processors.ocr.languages.clone());
+        self.ocr_page_routing = self.settings.processors.ocr.page_routing;
+        self.ocr_page_dpi = self.settings.processors.ocr.page_dpi.max(72);
         self
     }
 
@@ -1918,6 +1934,32 @@ impl DocumentProcessor {
                     );
                 }
             }
+        }
+
+        // Page-aware PDF routing: when OCR is enabled, classify each page and
+        // use native extraction for text pages while only OCR-ing scanned pages.
+        // This avoids OCR-ing text pages and stops silently dropping scanned
+        // pages from mixed PDFs (markitdown alone returns the text pages and
+        // leaves scanned ones blank).
+        if self.ocr_enabled
+            && self.ocr_page_routing
+            && is_pdf_extension(&extension)
+            && let Ok(routed) = process_pdf_page_aware(
+                input,
+                self.ocr_backend,
+                &self.ocr_languages,
+                self.ocr_page_dpi,
+            )
+            && !routed.trim().is_empty()
+        {
+            return Ok(ConvertedDocument {
+                title: input
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(std::string::ToString::to_string),
+                text_content: routed,
+                already_written: false,
+            });
         }
 
         // Try markitdown first
@@ -2931,6 +2973,241 @@ fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -> Result<St
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
     }
+}
+
+/// A reusable OCR session that initializes model-backed backends (currently
+/// the Rust-native `ocrs` engine) lazily — once — so that page-aware PDF
+/// routing can OCR several pages without re-loading models for every page.
+struct OcrSession {
+    backend: OcrBackend,
+    languages: Vec<String>,
+    ocrs_engine: Option<OcrEngine>,
+}
+
+impl OcrSession {
+    fn new(backend: OcrBackend, languages: &[String]) -> Self {
+        Self {
+            backend,
+            languages: languages.to_vec(),
+            ocrs_engine: None,
+        }
+    }
+
+    /// Lazily load the `ocrs` engine (models auto-downloaded into the XDG cache).
+    fn ocrs_engine(&mut self) -> Result<&OcrEngine> {
+        if self.ocrs_engine.is_none() {
+            eprintln!("OCRS: preparing models");
+            let detection_model_path =
+                download_to_cache(OCRS_DETECTION_MODEL_URL, "text-detection.rten")?;
+            let recognition_model_path =
+                download_to_cache(OCRS_RECOGNITION_MODEL_URL, "text-recognition.rten")?;
+            let detection_model = RtenModel::load_file(&detection_model_path)
+                .context("loading OCRS detection model")?;
+            let recognition_model = RtenModel::load_file(&recognition_model_path)
+                .context("loading OCRS recognition model")?;
+            let engine = OcrEngine::new(OcrEngineParams {
+                detection_model: Some(detection_model),
+                recognition_model: Some(recognition_model),
+                ..Default::default()
+            })
+            .context("initializing OCRS engine")?;
+            self.ocrs_engine = Some(engine);
+        }
+        self.ocrs_engine
+            .as_ref()
+            .ok_or_else(|| anyhow!("ocrs engine not initialized"))
+    }
+
+    /// Run the configured backend on a single image file.
+    fn ocr_image(&mut self, image: &Path) -> Result<String> {
+        let lang_arg = self.languages.join("+");
+        match self.backend {
+            OcrBackend::Tesseract => {
+                let output = ProcCommand::new("tesseract")
+                    .arg(image)
+                    .arg("stdout")
+                    .arg("-l")
+                    .arg(&lang_arg)
+                    .output()
+                    .context("running tesseract OCR")?;
+                if !output.status.success() {
+                    bail!(
+                        "tesseract failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            }
+            OcrBackend::Ocrs => {
+                let engine = self.ocrs_engine()?;
+                run_ocrs_on_image(image, engine, false)
+            }
+            OcrBackend::Surya => {
+                let output = ProcCommand::new("surya_ocr")
+                    .arg(image)
+                    .arg("--langs")
+                    .arg(&lang_arg)
+                    .output()
+                    .context("running surya OCR")?;
+                if !output.status.success() {
+                    bail!("surya failed: {}", String::from_utf8_lossy(&output.stderr));
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            }
+            OcrBackend::Easyocr => {
+                let script = format!(
+                    r"import easyocr; import sys; reader = easyocr.Reader(['{}']); result = reader.readtext('{}'); print('\n'.join([text for _, text, _ in result]))",
+                    lang_arg.replace('+', "','"),
+                    image.display()
+                );
+                let output = ProcCommand::new("python3")
+                    .arg("-c")
+                    .arg(&script)
+                    .output()
+                    .context("running easyocr")?;
+                if !output.status.success() {
+                    bail!(
+                        "easyocr failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            }
+        }
+    }
+}
+
+/// Page-aware PDF conversion (the Tier-0/Tier-1 routing core).
+///
+/// Uses [`extract_pages_markdown`] to classify every page as either native
+/// (extractable text / vector content) or scanned (image-only), and to extract
+/// Markdown for the native pages. Only the pages that need OCR are rendered to
+/// images and passed through the selected OCR backend; the native pages stay on
+/// the CPU-only fast path with no model. This avoids OCR-ing text pages and,
+/// crucially, stops silently dropping scanned pages from mixed PDFs.
+fn process_pdf_page_aware(
+    input: &Path,
+    backend: OcrBackend,
+    languages: &[String],
+    dpi: u32,
+) -> Result<String> {
+    let started = Instant::now();
+    let result = extract_pages_markdown(input, None)
+        .with_context(|| format!("classifying {}", input.display()))?;
+
+    // 0-indexed page indices that need OCR.
+    let ocr_pages: Vec<usize> = result
+        .pages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.needs_ocr)
+        .map(|(i, _)| i)
+        .collect();
+
+    eprintln!(
+        "route: {} pages, {} need OCR ({:.1}s to classify)",
+        result.pages.len(),
+        ocr_pages.len(),
+        started.elapsed().as_secs_f32()
+    );
+
+    if ocr_pages.is_empty() {
+        // Pure text/vector PDF — return native Markdown, no model, no OCR.
+        let body = join_routed_pages(&result.pages, &std::collections::HashMap::new())?;
+        eprintln!(
+            "route: all-native extraction in {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
+        return Ok(body);
+    }
+
+    // Render + OCR only the pages that need it.
+    let temp_dir = std::env::temp_dir().join(format!(
+        "ingestr-route-pdf-{}-{}",
+        std::process::id(),
+        input.file_stem().and_then(|s| s.to_str()).unwrap_or("doc")
+    ));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir)?;
+
+    let mut session = OcrSession::new(backend, languages);
+    let mut ocr_map: HashMap<usize, String> = HashMap::new();
+    let ocr_total = ocr_pages.len();
+
+    for (idx, page_idx) in ocr_pages.iter().enumerate() {
+        let page_no = *page_idx + 1;
+        let page_started = Instant::now();
+
+        // Render this single PDF page to PNG at 300 DPI (poppler).
+        // pdftoppm prefixes each output with the given prefix and appends the
+        // page number (e.g. `page-001-1.png`), so scan the per-page subdir for
+        // the produced file rather than guessing its exact name.
+        let page_dir = temp_dir.join(format!("page-{page_no:03}"));
+        let _ = fs::remove_dir_all(&page_dir);
+        fs::create_dir_all(&page_dir)?;
+        let dpi_arg = dpi.to_string();
+        let status = ProcCommand::new("pdftoppm")
+            .args([
+                "-png",
+                "-r",
+                &dpi_arg,
+                "-f",
+                &page_no.to_string(),
+                "-l",
+                &page_no.to_string(),
+            ])
+            .arg(input)
+            .arg(page_dir.join("page"))
+            .status()
+            .context("running pdftoppm (is poppler installed?)")?;
+        if !status.success() {
+            bail!("pdftoppm failed with status {status}");
+        }
+
+        let image = fs::read_dir(&page_dir)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+            .ok_or_else(|| anyhow!("pdftoppm produced no image for page {page_no}"))?;
+
+        let text = session
+            .ocr_image(&image)
+            .with_context(|| format!("OCR failed on PDF page {page_no}"))?;
+        ocr_map.insert(*page_idx, text);
+
+        let done = idx + 1;
+        eprintln!(
+            "route OCR: [{done}/{ocr_total}] page {page_no} done ({:.1}s)",
+            page_started.elapsed().as_secs_f32()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    let body = join_routed_pages(&result.pages, &ocr_map)?;
+    eprintln!("route: done in {:.1}s", started.elapsed().as_secs_f32());
+    Ok(body)
+}
+
+/// Join per-page Markdown into one document, using the OCR'd text for pages
+/// that were routed to OCR and the native extraction for everything else.
+fn join_routed_pages(
+    pages: &[pdf_inspector::PageMarkdown],
+    ocr_map: &HashMap<usize, String>,
+) -> Result<String> {
+    let mut sections = Vec::with_capacity(pages.len());
+    for (i, page) in pages.iter().enumerate() {
+        let content = if let Some(text) = ocr_map.get(&i) {
+            text.clone()
+        } else {
+            page.markdown.clone()
+        };
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        sections.push(format!("## Page {}\n\n{content}", i + 1));
+    }
+    Ok(sections.join("\n\n"))
 }
 
 fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
@@ -4761,5 +5038,42 @@ mod tests {
         assert!(!toc[1].has_code);
         assert!(!toc[2].has_table);
         assert!(toc[2].has_code);
+    }
+
+    #[test]
+    fn join_routed_pages_merges_native_and_ocr_text() {
+        use std::collections::HashMap;
+
+        let pages = vec![
+            pdf_inspector::PageMarkdown {
+                page: 0,
+                markdown: "native page one".to_string(),
+                needs_ocr: false,
+                ocr_reason: None,
+            },
+            pdf_inspector::PageMarkdown {
+                page: 1,
+                markdown: String::new(),
+                needs_ocr: true,
+                ocr_reason: Some("scanned".to_string()),
+            },
+            pdf_inspector::PageMarkdown {
+                page: 2,
+                markdown: "native page three".to_string(),
+                needs_ocr: false,
+                ocr_reason: None,
+            },
+        ];
+
+        let mut ocr_map = HashMap::new();
+        ocr_map.insert(1usize, "OCR text page two".to_string());
+
+        let joined = join_routed_pages(&pages, &ocr_map).unwrap();
+        assert!(joined.contains("## Page 1"));
+        assert!(joined.contains("native page one"));
+        assert!(joined.contains("## Page 2"));
+        assert!(joined.contains("OCR text page two"));
+        assert!(joined.contains("## Page 3"));
+        assert!(joined.contains("native page three"));
     }
 }

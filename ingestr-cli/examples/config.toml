@@ -40,3 +40,22 @@ model = "gpt-4o"
 # base_url = "http://localhost:11434/v1"
 # API key (can also use environment variables: OPENAI_API_KEY, GEMINI_API_KEY, DEEPSEEK_API_KEY)
 # api_key = "sk-..."
+
+[processors.ocr]
+# Enable OCR processing (as a fallback for scanned or image-only inputs)
+enabled = false
+# OCR backend: tesseract, ocrs, surya, easyocr
+backend = "ocrs"
+# Languages for OCR (passed to the backend)
+languages = ["eng"]
+# Page-aware PDF routing: extract text pages natively and OCR only scanned
+# pages. Disable (false) to force whole-document OCR for PDFs.
+page_routing = true
+# Render DPI used when OCR-ing a scanned PDF page.
+page_dpi = 300
+
+[processors.vlm]
+enabled = false
+# model = "gpt-4o"
+# llm_url = "http://localhost:11434/v1"
+# prompts = { default = "Describe this image in detail." }
