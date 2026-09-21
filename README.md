@@ -112,9 +112,6 @@ ingestr search "budget" --limit 5
 
 # Output as JSON
 ingestr search "report" --json
-
-# Output as YAML
-ingestr search "report" --yaml
 ```
 
 ### Configuration

@@ -1,0 +1,42 @@
+# ============================================
+# CLIPPY CONFIGURATION
+# ============================================
+# Place this file in your project root (next to Cargo.toml)
+# These thresholds complement the lint configuration in Cargo.toml
+
+# Complexity thresholds - prevent sprawling functions
+cognitive-complexity-threshold = 20
+type-complexity-threshold = 200
+too-many-lines-threshold = 160
+
+# Domain terms that shouldn't trigger spelling warnings in docs
+# Add your own domain-specific terms here
+doc-valid-idents = [
+    "LLM",       # Large Language Model
+    "VLM",       # Vision Language Model
+    "OCR",       # Optical Character Recognition
+    "MCP",       # Model Context Protocol
+    "TOC",       # Table of Contents
+    "Tantivy",   # Search index crate
+    "MarkItDown",# Document conversion crate
+    "Markdown",  # Output format
+    "PDF",       # Portable Document Format
+    "DOCX",      # Word document
+    "XLSX",      # Excel spreadsheet
+    "PPTX",      # PowerPoint presentation
+    "XDG",       # FreeDesktop directory spec
+    "API",       # Application Programming Interface
+    "CLI",       # Command Line Interface
+    "HTML",      # HyperText Markup Language
+    "OpenAI",    # Provider / API style
+    "Gemini",    # Provider
+    "DeepSeek",  # Provider
+    "Ollama",    # Local model server
+    "LM",        # Language Model
+    "JSON",      # JavaScript Object Notation
+    "TOML",      # Tom's Obvious Minimal Language
+    "URL",       # Uniform Resource Locator
+    "HTTP",      # HyperText Transfer Protocol
+    "HTTPS",     # HTTP Secure
+    "AI",        # Artificial Intelligence
+]

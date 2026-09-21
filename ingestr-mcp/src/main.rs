@@ -1,3 +1,6 @@
+//! `ingestr-mcp`: Model Context Protocol server exposing ingestr full-text
+//! search to AI assistants.
+
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -63,7 +66,10 @@ impl AppPaths {
         };
 
         if active_config.parent().is_none() {
-            return Err(anyhow!("invalid config file path: {active_config:?}"));
+            return Err(anyhow!(
+                "invalid config file path: {}",
+                active_config.display()
+            ));
         }
 
         let state_dir = default_state_dir()?;
@@ -77,8 +83,7 @@ impl AppPaths {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct AppConfig {
     index: IndexConfig,
@@ -107,10 +112,10 @@ fn main() {
 
 fn try_main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(&cli.log_level)?;
+    init_logging(&cli.log_level);
 
-    let mut paths = AppPaths::discover(cli.config.clone())?;
-    let config = load_or_init_config(&mut paths, cli.config.as_ref())?;
+    let paths = AppPaths::discover(cli.config.clone())?;
+    let config = load_or_init_config(&paths, cli.config.as_ref())?;
 
     if cli.show_config {
         output_mcp_config()?;
@@ -228,7 +233,7 @@ fn handle_message(index: &mut SearchIndex, line: &str) -> Result<serde_json::Val
                         .ok_or_else(|| anyhow!("missing query"))?;
                     let limit = args
                         .get("limit")
-                        .and_then(|l| l.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .unwrap_or(10)
                         .clamp(1, 50) as usize;
 
@@ -242,13 +247,12 @@ fn handle_message(index: &mut SearchIndex, line: &str) -> Result<serde_json::Val
                         .ok_or_else(|| anyhow!("missing path"))?;
                     let confirm = args
                         .get("confirm")
-                        .and_then(|c| c.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
 
                     if !confirm {
                         return Err(anyhow!(
-                            "confirmation required: set confirm=true to open {}",
-                            path_str
+                            "confirmation required: set confirm=true to open {path_str}"
                         ));
                     }
 
@@ -269,15 +273,14 @@ fn handle_message(index: &mut SearchIndex, line: &str) -> Result<serde_json::Val
     }
 }
 
-fn init_logging(level: &str) -> Result<()> {
+fn init_logging(level: &str) {
     let env = Env::default().default_filter_or(level);
     env_logger::Builder::from_env(env)
         .format_timestamp_millis()
         .init();
-    Ok(())
 }
 
-fn load_or_init_config(paths: &mut AppPaths, cli_override: Option<&PathBuf>) -> Result<AppConfig> {
+fn load_or_init_config(paths: &AppPaths, cli_override: Option<&PathBuf>) -> Result<AppConfig> {
     if !paths.active_config.exists() && cli_override.is_none() {
         if let Some(parent) = paths.active_config.parent() {
             fs::create_dir_all(parent)
@@ -313,7 +316,7 @@ fn load_or_init_config(paths: &mut AppPaths, cli_override: Option<&PathBuf>) -> 
         .display()
         .to_string();
 
-    debug!("effective config: {:?}", config);
+    debug!("effective config: {config:?}");
     Ok(config)
 }
 
@@ -328,11 +331,7 @@ fn write_default_config(path: &Path) -> Result<()> {
 }
 
 fn expand_path(path: PathBuf) -> Result<PathBuf> {
-    if let Some(text) = path.to_str() {
-        expand_str_path(text)
-    } else {
-        Ok(path)
-    }
+    path.to_str().map(expand_str_path).unwrap_or(Ok(path))
 }
 
 fn expand_str_path(text: &str) -> Result<PathBuf> {
@@ -434,9 +433,8 @@ fn ensure_service_running(paths: &AppPaths, index_dir: &Path) -> Result<()> {
     if let Some(pid) = read_pid(&pid_path)? {
         if process_running(pid) {
             return Ok(());
-        } else {
-            fs::remove_file(&pid_path).ok();
         }
+        fs::remove_file(&pid_path).ok();
     }
 
     let ingestr_bin = which_ingestr_cli()?;
@@ -463,7 +461,7 @@ fn ensure_service_running(paths: &AppPaths, index_dir: &Path) -> Result<()> {
             "failed to start ingestr service (status {}){}",
             output.status,
             if stderr.trim().is_empty() {
-                "".to_string()
+                String::new()
             } else {
                 format!(": {}", stderr.trim())
             }
@@ -475,7 +473,7 @@ fn ensure_service_running(paths: &AppPaths, index_dir: &Path) -> Result<()> {
         if let Some(pid) = read_pid(&pid_path)?
             && process_running(pid)
         {
-            info!("ingestr service started pid {}", pid);
+            info!("ingestr service started pid {pid}");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));

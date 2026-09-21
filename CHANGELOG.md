@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Conformance to byteowlz standards**: Added `CONTEXT.md`, `docs/adr/` (template + README), `clippy.toml`, `.ast-grep/rules/`, and `scripts/drift-check.sh`; rewrote `AGENTS.md` with source-of-truth, strict-lint, and JSON/TOML-only guidance; added workspace lints and the full `just check-all` gate.
+- **Removed `--yaml` output**: The `--yaml` flag and `serde_yaml` dependency were removed to enforce the project's JSON/TOML-only rule (machine output is JSON). Use `--json` instead.
+- **Frontmatter serialized as JSON**: Markdown frontmatter (via `--meta`) is now emitted as JSON rather than YAML. JSON is a valid YAML subset, so standard `---` frontmatter consumers still parse it.
+- **VLM API key passed as a Bearer header**: The API key is now sent to the vision model endpoint via an `Authorization: Bearer` header instead of setting process-global `OPENAI_*` environment variables (which are `unsafe` in Rust 2024 and were not consumed as auth).
+
 ## [0.3.5] - 2026-08-27
 
 ### Fixed
@@ -55,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Clean output by default**: Conversion output is now pure markdown with no YAML frontmatter. Use `--meta` to include metadata when needed.
 - **Post-processing cleaning pipeline**: Automatically strips page numbers, repeated headers/footers, fixes broken PDF line-wraps, and collapses excessive blank lines. Use `--raw` to skip cleaning.
 - **Token budget control**: `--max-tokens N` and `--max-chars N` truncate output at section boundaries with a notice showing remaining content. Combine with `--offset N` for paginated reading.
-- **Table of contents extraction**: `--toc` shows document structure with section numbers, estimated token counts, and markers for tables/code blocks. Supports `--json` and `--yaml` output.
+- **Table of contents extraction**: `--toc` shows document structure with section numbers, estimated token counts, and markers for tables/code blocks. Supports `--json` output.
 - **Section-level retrieval**: `-s / --section` extracts a specific section by number (e.g., `2.1`) or heading name (case-insensitive substring match).
 - **Page-level access**: `--pages "1-3,7"` converts only specific pages from PDFs (requires page break markers in converted output).
 - **Native URL support**: Pass a URL as input to fetch and convert in one step (e.g., `ingestr https://example.com/report.pdf`).

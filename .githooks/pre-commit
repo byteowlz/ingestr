@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# pre-commit — primary guard for agents. Runs the drift check and fails the
+# commit if documented facts no longer match the manifests/PATH.
+set -uo pipefail
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -x "$DIR/scripts/drift-check.sh" ]; then
+  "$DIR/scripts/drift-check.sh" || exit 1
+fi
+exit 0

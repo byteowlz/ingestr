@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# pre-push — run the full check gate before pushing.
+set -uo pipefail
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+(
+  cd "$DIR"
+  cargo fmt --check || exit 1
+  cargo clippy --workspace -- -D warnings || exit 1
+  if [ -x "scripts/drift-check.sh" ]; then
+    scripts/drift-check.sh || exit 1
+  fi
+)
+exit $?

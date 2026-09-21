@@ -10,9 +10,20 @@ help:
 fmt:
     cargo fmt
 
-# Workspace check
+# Workspace check (fast type-check)
 check:
     cargo check
+
+# Full gate: format + clippy (deny warnings) + drift + tests
+check-all:
+    cargo fmt --check
+    cargo clippy --workspace -- -D warnings
+    ./scripts/drift-check.sh
+    cargo test --workspace
+
+# Drift check: verify documented facts match manifests/PATH
+drift-check:
+    ./scripts/drift-check.sh
 
 # Check individual crates
 check-cli:
