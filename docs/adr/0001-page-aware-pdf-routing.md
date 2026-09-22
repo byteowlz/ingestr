@@ -1,35 +1,42 @@
-# Page-aware PDF routing for OCR
+# Page-aware PDF routing via LiteParse
 
-Mixed-content PDFs (some text pages, some scanned pages) were previously handled
-either by markitdown (native text only, silently dropping scanned pages) or by
-whole-document OCR (OCR-ing every page, including native text ones). We decided
-to classify each PDF page and route text/vector pages to fast native Markdown
-extraction while sending only scanned pages to the selected OCR backend, using
-the `pdf-inspector` crate for per-page detection.
+Mixed-content PDFs (some text pages, some scanned pages) previously hit either
+markitdown (native text only, silently dropping scanned pages) or
+whole-document OCR (OCR-ing every page, including native text ones). We adopted
+**LiteParse** (`run-llama/liteparse`, Apache-2.0) as the Tier-0 PDF parser: it
+classifies each page (`is_complex` → `needs_ocr` + reasons), extracts native
+Markdown for text/vector pages (PDFium, ~2-5ms/page, no model), and OCRs and
+merges only the scanned/text-sparse pages itself. This superseded the earlier
+hand-rolled pdf-inspector routing.
 
 Status: accepted
 
 ## Considered options
 
-- **Whole-document OCR (current behavior)**: simple but wastes compute on text
-  pages and is slow. Rejected for the Tier-0 CPU path.
-- **markitdown then whole-OCR fallback (current behavior)**: for a mixed PDF
-  markitdown returns the text pages (non-empty), so the OCR fallback never runs
-  and scanned pages are silently lost. Rejected.
-- **Per-page routing via `pdf-inspector` (chosen)**: `extract_pages_markdown`
-  returns per-page Markdown plus a `needs_ocr` flag from PDF internals (text
-  operators, images) with no model load (~10-50ms/page). Only the flagged pages
-  are rendered (pdftoppm) and OCR'd; the rest stay on the native path.
+- **Whole-document OCR**: simple but wastes compute on text pages. Rejected.
+- **markitdown then whole-OCR fallback**: a mixed PDF returns the text pages
+  (non-empty), so the OCR fallback never runs and scanned pages are lost.
+  Rejected.
+- **Hand-rolled per-page routing via `pdf-inspector`**: worked, but `liteparse`
+  beats it on every benchmark (ParseBench 0.364 vs 0.283; olmOCR 39.6 vs 33.7;
+  opendataloader 0.886 vs 0.842) and also beats markitdown (ParseBench 0.364 vs
+  0.185). Superseded — we removed the pdf-inspector dependency and the routing
+  code.
+- **LiteParse (chosen)**: single engine for native extraction + per-page
+  classification + selective OCR + OCR merge, with an `ocr_server_url` HTTP seam
+  (Phase 2: PaddleOCR-VL) and `oar-ocr` GPU features (Phase 3). Built-in
+  Tesseract OCR. PDFium is auto-downloaded at build (musl supported) and loaded
+  at runtime.
 
 ## Consequences
 
-- Scanned pages in mixed PDFs are no longer dropped; text pages are no longer
-  OCR'd, so CPU cost scales with the number of truly scanned pages.
-- Adds a `pdf-inspector` dependency (MIT, pure Rust, no OCR/render features
-  enabled — poppler `pdftoppm` remains the rasterizer).
-- `[processors.ocr]` gains `page_routing` (default `true`) and `page_dpi`
-  (default `300`); setting `page_routing = false` restores whole-document OCR.
-- Routing is only active when OCR is enabled for a PDF; otherwise the markitdown
-  path is unchanged.
-- A future GPU tier can replace the per-page OCR backend while keeping the
-  classification and merge logic unchanged.
+- Scanned pages in mixed PDFs are no longer dropped; text pages are not OCR'd.
+- PDF parsing quality and speed improve substantially (table, heading and
+  multi-column reconstruction; 187-page German dissertation in ~2.7s).
+- Adds `liteparse` + `tokio` deps. `pdf-inspector` is removed.
+- `[processors.ocr]` gains `ocr_server_url` (optional OCR HTTP server) and
+  `page_dpi`; `page_routing` was removed as liteparse routes internally.
+- A future GPU tier plugs in via `ocr_server_url` or the `oar-ocr` feature,
+  without changing the parser.
+- Ingest's own OCR backends (ocrs/surya/easyocr via `run_ocr`) remain for the
+  non-PDF image path and as a fallback.

@@ -48,11 +48,11 @@ enabled = false
 backend = "ocrs"
 # Languages for OCR (passed to the backend)
 languages = ["eng"]
-# Page-aware PDF routing: extract text pages natively and OCR only scanned
-# pages. Disable (false) to force whole-document OCR for PDFs.
-page_routing = true
-# Render DPI used when OCR-ing a scanned PDF page.
+# Render DPI used when OCR-ing scanned pages.
 page_dpi = 300
+# Optional local OCR HTTP server URL (liteparse OCR API). When set, PDF OCR
+# is delegated to this server instead of liteparse's built-in Tesseract.
+# ocr_server_url = "http://localhost:8000"
 
 [processors.vlm]
 enabled = false

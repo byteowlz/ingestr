@@ -4,7 +4,7 @@ A background service that watches directories for documents, converts them to Ma
 
 ## Features
 
-- **Document Conversion**: Automatically converts documents (PDF, DOCX, XLSX, PPTX, HTML, etc.) to Markdown using [markitdown](https://crates.io/crates/markitdown)
+- **Document Conversion**: Automatically converts documents (PDF, DOCX, XLSX, PPTX, HTML, etc.) to Markdown. PDFs use [LiteParse](https://github.com/run-llama/liteparse) (fast native extraction + page-aware OCR merge); other formats use [markitdown](https://crates.io/crates/markitdown).
 - **Full-Text Search**: Indexes converted documents with [Tantivy](https://github.com/quickwit-oss/tantivy) for fast search
 - **Background Service**: Runs as a daemon watching for file changes
 - **MCP Server**: Exposes search functionality to AI assistants via the Model Context Protocol

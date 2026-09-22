@@ -139,6 +139,13 @@ _Avoid_: response
 The process of classifying each PDF page (text/vector vs scanned) and routing
 text pages to native Markdown extraction while sending only scanned pages to
 OCR. Keeps scanned pages from being silently dropped in mixed PDFs and avoids
-OCR-ing text pages. Configured under `[processors.ocr]` (`page_routing`,
-`page_dpi`).
+OCR-ing text pages. Handled internally by LiteParse (`is_complex` → `needs_ocr`);
+configured under `[processors.ocr]` (`page_dpi`, `ocr_server_url`).
 _Avoid_: routing (ambiguous with file-type routing)
+
+**LiteParse**:
+Apache-2.0 Rust PDF parser used as ingestr's Tier-0 document engine. Extracts
+native text/vector pages via PDFium (no model), classifies pages (`is_complex`),
+and OCRs/merges only scanned or text-sparse pages. Supports an `ocr_server_url`
+HTTP OCR seam and `oar-ocr` GPU features.
+_Avoid_: parser (generic), llama/liteparse name confusion

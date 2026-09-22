@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Page-aware PDF routing (Tier 0/1)**: When OCR is enabled on a PDF, `ingestr` now classifies each page via `pdf-inspector` and routes text/vector pages to native Markdown extraction (CPU, no model) while only OCR-ing scanned/image-only pages. This avoids OCR-ing text pages and stops silently dropping scanned pages from mixed PDFs. Controlled by `[processors.ocr]` `page_routing` (default `true`) and `page_dpi` (default `300`).
+- **LiteParse as the Tier-0 PDF parser**: `ingestr` now uses [LiteParse](https://github.com/run-llama/liteparse) (Apache-2.0) for PDF conversion. It classifies each page, extracts text/vector pages natively (PDFium, ~2-5ms/page, no model), and OCRs/merges only scanned or text-sparse pages — so mixed PDFs no longer drop their scanned pages. This replaced the earlier hand-rolled `pdf-inspector` routing (removed) and beats both `pdf-inspector` and markitdown on ParseBench/olmOCR/opendataloader benchmarks. Adds `liteparse` + `tokio` deps; absorbed the old `jinja`-style route into the parser.
+- **`[processors.ocr]` `ocr_server_url`**: optional local OCR HTTP server URL (LiteParse OCR API) that delegates PDF OCR to an external engine (e.g. a PaddleOCR-VL server) instead of LiteParse's built-in Tesseract.
 
 ### Changed
 
