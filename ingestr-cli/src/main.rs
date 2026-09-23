@@ -82,7 +82,12 @@ static PAGE_BREAK_RE: LazyLock<Regex> =
 
 fn main() {
     if let Err(err) = try_main() {
-        let _ = writeln!(io::stderr(), "{err:?}");
+        // Clean, teachy error to stderr (no stack trace unless --trace).
+        let _ = writeln!(io::stderr(), "{err}");
+        let chain = err.chain().skip(1);
+        for cause in chain {
+            let _ = writeln!(io::stderr(), "  caused by: {cause}");
+        }
         std::process::exit(1);
     }
 }
@@ -196,7 +201,7 @@ struct CommonOpts {
     diagnostics: bool,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum ColorOption {
     Auto,
     Always,
@@ -212,7 +217,10 @@ enum Command {
     },
     /// Query the search index
     Search(SearchCommand),
-    /// Convert a single file to Markdown
+    /// Convert documents to Markdown (single file, directory, or URL)
+    #[command(
+        after_help = "Examples:\n\n  Convert one file to stdout:\n    ingestr convert report.pdf\n\n  Convert every document in the current directory to .md:\n    ingestr convert .\n\n  Convert every document in a directory tree (incl. subdirs) to .md:\n    ingestr convert . --recursive\n\n  Preview what would be converted (writes nothing):\n    ingestr convert . --dry-run\n\n  Machine-readable JSON summary of a batch conversion:\n    ingestr convert docs/ --recursive --json\n\n  Convert only PDFs and DOCX files, writing to out/:\n    ingestr convert . --recursive --extensions pdf,docx --output out/\n\n  Convert all .pptx files in the current directory:\n    ingestr convert . --batch pptx\n"
+    )]
     Convert(ConvertCommand),
     /// Create config directories and default files
     Init(InitCommand),
@@ -295,6 +303,9 @@ struct ConvertCommand {
     /// Example: --batch pptx converts all .pptx files to .md alongside sources
     #[arg(long, value_name = "EXT")]
     batch: Option<String>,
+    /// Stop at the first conversion failure instead of continuing
+    #[arg(long)]
+    fail_fast: bool,
     /// Write output to a file or directory instead of stdout. When converting
     /// a directory and no output is specified, writes .md files alongside sources.
     #[arg(short, long, value_name = "PATH")]
@@ -3026,6 +3037,13 @@ fn liteparse_runtime() -> Result<&'static Runtime> {
         .map_err(|e| anyhow!("failed to create liteparse tokio runtime: {e}"))
 }
 
+/// Whether a path component denotes a hidden file/dir. The special "." and
+/// ".." components are not hidden (they are the current/parent directory), so
+/// a relative input like "." still matches its own contents.
+fn is_hidden_component(component: Option<&str>) -> bool {
+    component.is_some_and(|s| s.starts_with('.') && s != "." && s != "..")
+}
+
 /// Map an ingestr OCR language to a Tesseract/liteparse language code.
 fn map_ocr_lang(lang: &str) -> String {
     match lang.to_ascii_lowercase().as_str() {
@@ -3303,6 +3321,7 @@ fn output_final(
         }
     } else if ctx.common.json {
         let result = serde_json::json!({
+            "ok": true,
             "source": source_label,
             "tokens": estimate_tokens(&content),
             "content": content,
@@ -3383,8 +3402,9 @@ fn handle_convert_directory(
         .transpose()
         .context("expanding output path")?;
 
-    // Determine if we should write alongside source files
-    let in_place = cmd.in_place || (output_dir.is_none() && !ctx.common.dry_run);
+    // Determine if we should write alongside source files. Computed
+    // independently of dry-run so --dry-run shows the real destination.
+    let in_place = cmd.in_place || output_dir.is_none();
 
     // Collect files to process
     let walker = if cmd.recursive {
@@ -3413,11 +3433,13 @@ fn handle_convert_directory(
             }
         })
         .filter(|e| {
-            // Skip hidden files if skip_hidden is set
+            // Skip hidden files if skip_hidden is set. Ignore the special "."
+            // (current dir) and ".." components so a relative input like "."
+            // still matches its contents.
             if settings.skip_hidden {
                 !e.path()
                     .components()
-                    .any(|c| c.as_os_str().to_str().is_some_and(|s| s.starts_with('.')))
+                    .any(|c| is_hidden_component(c.as_os_str().to_str()))
             } else {
                 true
             }
@@ -3426,16 +3448,26 @@ fn handle_convert_directory(
         .collect();
 
     if files.is_empty() {
-        info!("no files found to convert");
+        info!("no supported documents found to convert");
+        if ctx.common.json {
+            let output = serde_json::json!({
+                "ok": true,
+                "found": 0,
+                "plans": [],
+                "stats": { "total": 0, "converted": 0, "skipped": 0, "failed": 0, "errors": [] },
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
         return Ok(());
     }
 
     let total = files.len();
     if !ctx.common.quiet {
-        println!("Found {total} files to convert");
+        eprintln!("Found {total} files to convert");
     }
 
     if ctx.common.dry_run {
+        let mut plans: Vec<serde_json::Value> = Vec::with_capacity(files.len());
         for file in &files {
             let output_path = if in_place {
                 let mut out = file.clone();
@@ -3449,19 +3481,41 @@ fn handle_convert_directory(
             } else {
                 "-".to_string()
             };
-            println!("Would convert {} -> {}", file.display(), output_path);
+            if ctx.common.json {
+                plans.push(serde_json::json!({
+                    "source": file.display().to_string(),
+                    "output": output_path,
+                }));
+            } else {
+                println!("Would convert {} -> {}", file.display(), output_path);
+            }
+        }
+        if ctx.common.json {
+            let output = serde_json::json!({ "ok": true, "found": total, "plans": plans });
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
         return Ok(());
     }
 
-    // Use parallel processing if requested
-    let parallel = ctx
-        .common
-        .parallel
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    // Fail-fast demands deterministic, ordered execution, so force the
+    // sequential path when requested.
+    let parallel = if cmd.fail_fast {
+        1
+    } else {
+        ctx.common.parallel.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        })
+    };
 
-    // Single-threaded mode gets interactive progress
-    let show_progress = parallel == 1 && !ctx.common.quiet && !ctx.common.no_progress;
+    // Progress animation only on a TTY stderr (not when piped) and honoring
+    // NO_COLOR / --no-color, so it never corrupts piped or machine output.
+    let stderr_tty = io::stderr().is_terminal();
+    let color_ok = !ctx.common.no_color
+        && ctx.common.color != ColorOption::Never
+        && env::var_os("NO_COLOR").is_none()
+        && env::var("TERM").as_deref() != Ok("dumb");
+    let show_progress =
+        parallel == 1 && !ctx.common.quiet && !ctx.common.no_progress && stderr_tty && color_ok;
 
     let converted = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
@@ -3491,44 +3545,53 @@ fn handle_convert_directory(
                     .collect()
             })
     } else {
-        files
-            .iter()
-            .enumerate()
-            .map(|(idx, file)| {
-                // Show progress before processing
-                if show_progress {
-                    let num = idx + 1;
-                    let file_name = file
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    eprint!("\r\x1b[K[{num}/{total}] Converting {file_name}...");
-                    let _ = io::stderr().flush();
+        let mut results = Vec::with_capacity(files.len());
+        for (idx, file) in files.iter().enumerate() {
+            // Show progress before processing
+            if show_progress {
+                let num = idx + 1;
+                let file_name = file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                eprint!("\r\x1b[K[{num}/{total}] Converting {file_name}...");
+                let _ = io::stderr().flush();
+            }
+
+            let result = process_file_for_batch(
+                file,
+                input_dir,
+                output_dir.as_ref(),
+                settings,
+                cmd,
+                in_place,
+                &converted,
+                &failed,
+                &errors,
+            );
+
+            // Show result indicator
+            if show_progress {
+                match &result {
+                    Ok(_) => eprint!(" ✓"),
+                    Err(_) => eprint!(" ✗"),
                 }
+            }
 
-                let result = process_file_for_batch(
-                    file,
-                    input_dir,
-                    output_dir.as_ref(),
-                    settings,
-                    cmd,
-                    in_place,
-                    &converted,
-                    &failed,
-                    &errors,
-                );
-
-                // Show result indicator
+            // Fail-fast: a genuine conversion failure aborts the batch with a
+            // non-zero exit so scripts stop on the first bad input.
+            if cmd.fail_fast
+                && let Err(err) = result
+            {
                 if show_progress {
-                    match &result {
-                        Ok(_) => eprint!(" ✓"),
-                        Err(_) => eprint!(" ✗"),
-                    }
+                    eprintln!();
                 }
+                return Err(err.context(format!("conversion failed at {}", file.display())));
+            }
 
-                result
-            })
-            .collect()
+            results.push(result);
+        }
+        results
     };
 
     let stats = ConvertStats {
@@ -3543,6 +3606,7 @@ fn handle_convert_directory(
     if ctx.common.json {
         let successful_results: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
         let output = serde_json::json!({
+            "ok": stats.failed == 0,
             "stats": stats,
             "results": successful_results,
         });
@@ -3552,16 +3616,32 @@ fn handle_convert_directory(
         if show_progress {
             eprintln!();
         }
-        println!("\nConversion complete:");
-        println!("  Total files: {}", stats.total);
-        println!("  Converted:   {}", stats.converted);
-        println!("  Failed:      {}", stats.failed);
-        if !stats.errors.is_empty() {
-            println!("\nErrors:");
-            for err in &stats.errors {
-                println!("  - {err}");
+        if ctx.common.quiet {
+            // Quiet mode: only summarize failures.
+            if stats.failed > 0 {
+                eprintln!("ingestr: {}/{} files failed", stats.failed, stats.total);
+            }
+        } else {
+            println!("\nConversion complete:");
+            println!("  Total files: {}", stats.total);
+            println!("  Converted:   {}", stats.converted);
+            println!("  Failed:      {}", stats.failed);
+            if !stats.errors.is_empty() {
+                println!("\nErrors:");
+                for err in &stats.errors {
+                    println!("  - {err}");
+                }
             }
         }
+    }
+
+    // Non-zero exit code when any file failed (unless fail-fast already bailed).
+    if stats.failed > 0 {
+        bail!(
+            "{} of {} file(s) failed to convert",
+            stats.failed,
+            stats.total
+        );
     }
 
     Ok(())
@@ -4883,5 +4963,15 @@ mod tests {
         assert_eq!(map_ocr_lang("ENG"), "eng");
         assert_eq!(map_ocr_lang("deu"), "deu");
         assert_eq!(map_ocr_lang("fra"), "fra");
+    }
+
+    #[test]
+    fn hidden_component_ignores_dot_and_dotdot() {
+        assert!(is_hidden_component(Some(".git")));
+        assert!(is_hidden_component(Some(".env")));
+        assert!(!is_hidden_component(Some(".")));
+        assert!(!is_hidden_component(Some("..")));
+        assert!(!is_hidden_component(Some("src")));
+        assert!(!is_hidden_component(None));
     }
 }

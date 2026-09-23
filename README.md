@@ -64,9 +64,33 @@ ingestr <COMMAND>
 Commands:
   service      Manage the background conversion and indexing service
   search       Query the search index
+  convert      Convert documents to Markdown (file, directory, or URL)
   init         Create config directories and default files
   config       Inspect and manage configuration
+  cache        Inspect or clear the conversion cache
   completions  Generate shell completions
+```
+
+### Converting documents
+
+Convert a single file (to stdout):
+
+```bash
+ingestr convert report.pdf
+```
+
+Convert **every document in the current directory** to `.md`:
+
+```bash
+ingestr convert .
+```
+
+Include subdirectories, write to a folder, or preview the plan:
+
+```bash
+ingestr convert . --recursive --output out/
+ingestr convert . --recursive --dry-run
+ingestr convert . --recursive --json
 ```
 
 ### Service Commands
