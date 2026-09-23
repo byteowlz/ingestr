@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Top-notch `convert` CLI**: rich help with worked examples, `--fail-fast` (stop at the first conversion error), TTY-gated color/progress (honoring `NO_COLOR`/`--no-color`), machine-mode `--json` contract (stdout always parseable, `ok`/`found`/`plans` envelopes, per-file results and errors), clean display-only error output, and a non-zero exit code when any file fails. `ingestr convert .` now converts every document in the cwd one-shot; add `--recursive` for subdirs.
+- **Bug fix**: a relative input like `ingestr convert .` no longer silently skips every file (the hidden-file filter treated the `.` current-dir component as hidden).
 - **LiteParse as the Tier-0 PDF parser**: `ingestr` now uses [LiteParse](https://github.com/run-llama/liteparse) (Apache-2.0) for PDF conversion. It classifies each page, extracts text/vector pages natively (PDFium, ~2-5ms/page, no model), and OCRs/merges only scanned or text-sparse pages — so mixed PDFs no longer drop their scanned pages. This replaced the earlier hand-rolled `pdf-inspector` routing (removed) and beats both `pdf-inspector` and markitdown on ParseBench/olmOCR/opendataloader benchmarks. Adds `liteparse` + `tokio` deps; absorbed the old `jinja`-style route into the parser.
 - **`[processors.ocr]` `ocr_server_url`**: optional local OCR HTTP server URL (LiteParse OCR API) that delegates PDF OCR to an external engine (e.g. a PaddleOCR-VL server) instead of LiteParse's built-in Tesseract.
 
