@@ -144,8 +144,14 @@ configured under `[processors.ocr]` (`page_dpi`, `ocr_server_url`).
 _Avoid_: routing (ambiguous with file-type routing)
 
 **LiteParse**:
-Apache-2.0 Rust PDF parser used as ingestr's Tier-0 document engine. Extracts
-native text/vector pages via PDFium (no model), classifies pages (`is_complex`),
-and OCRs/merges only scanned or text-sparse pages. Supports an `ocr_server_url`
-HTTP OCR seam and `oar-ocr` GPU features.
+Apache-2.0 Rust parser used as ingestr's Tier-0 document engine for PDF and
+office formats. Extracts native text/vector pages via PDFium (no model),
+classifies pages (`is_complex`), OCRs/merges only scanned or text-sparse pages,
+and converts PPTX/DOCX/XLSX via LibreOffice while extracting embedded images.
+Supports an `ocr_server_url` HTTP OCR seam and `oar-ocr` GPU features.
 _Avoid_: parser (generic), llama/liteparse name confusion
+
+**Office formats**:
+PPTX/DOCX/XLSX/PPT/ODP/KEY/DOC/ODT/XLS/ODS converted via LiteParse (LibreOffice
+→ text extraction + embedded-image extraction) rather than markitdown.
+_Avoid_: office docs (ambiguous)

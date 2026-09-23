@@ -1848,6 +1848,10 @@ struct DocumentProcessor {
     ocr_languages: Vec<String>,
     /// Render DPI used for OCR-ing scanned pages.
     ocr_page_dpi: u32,
+    /// Directory where LiteParse writes extracted embedded images (e.g. figures
+    /// / charts from a PPTX). `None` keeps image references in the Markdown
+    /// without writing image files.
+    image_output_dir: Option<PathBuf>,
 }
 
 impl DocumentProcessor {
@@ -1864,6 +1868,7 @@ impl DocumentProcessor {
             ocr_backend: OcrBackend::Ocrs,
             ocr_languages: vec!["eng".to_string()],
             ocr_page_dpi: 300,
+            image_output_dir: None,
         }
     }
 
@@ -1898,6 +1903,11 @@ impl DocumentProcessor {
         self.ocr_languages =
             languages.unwrap_or_else(|| self.settings.processors.ocr.languages.clone());
         self.ocr_page_dpi = self.settings.processors.ocr.page_dpi.max(72);
+        self
+    }
+
+    fn with_image_output_dir(mut self, output_dir: Option<PathBuf>) -> Self {
+        self.image_output_dir = output_dir;
         self
     }
 
@@ -1945,11 +1955,13 @@ impl DocumentProcessor {
             }
         }
 
-        // PDF path: use LiteParse as the Tier-0 parser. It extracts native
-        // text for text/vector pages and OCRs only scanned/text-sparse pages,
-        // so mixed PDFs no longer drop their scanned pages and CPU cost scales
-        // with truly scanned content.
-        if is_pdf_extension(&extension)
+        // PDF + office path: use LiteParse as the Tier-0 parser. For PDFs it
+        // extracts native text for text/vector pages and OCRs only scanned/
+        // text-sparse pages, so mixed PDFs no longer drop scanned pages. For
+        // PPTX/DOCX/XLSX it converts via LibreOffice and extracts per-slide /
+        // per-section text plus embedded images. This replaces markitdown for
+        // these formats (markitdown's PPTX path is broken).
+        if is_liteparse_extension(&extension)
             && let Ok(parsed) = self.process_pdf_with_liteparse(input)
             && !parsed.text_content.trim().is_empty()
         {
@@ -2108,12 +2120,14 @@ impl DocumentProcessor {
         })
     }
 
-    /// Convert a PDF to Markdown with LiteParse.
+    /// Convert a PDF or office document to Markdown with LiteParse.
     ///
-    /// LiteParse is the Tier-0 parser: it extracts text/vector pages natively
-    /// (PDFium, ~2-5ms/page, no ML model) and only OCRs the pages it classifies
-    /// as scanned or text-sparse, merging the results itself. It replaces both
-    /// the markitdown native path and the hand-rolled page-routing for PDFs.
+    /// LiteParse is the Tier-0 parser: for PDFs it extracts text/vector pages
+    /// natively (PDFium, ~2-5ms/page, no ML model) and only OCRs the pages it
+    /// classifies as scanned or text-sparse. For office formats (pptx/docx/
+    /// xlsx/…) it converts via LibreOffice and extracts per-slide/per-section
+    /// text plus embedded images. It replaces both the markitdown native path
+    /// and the hand-rolled page routing.
     fn process_pdf_with_liteparse(&self, input: &Path) -> Result<ConvertedDocument> {
         let path_str = input
             .to_str()
@@ -2124,6 +2138,10 @@ impl DocumentProcessor {
             .first()
             .map(String::as_str)
             .unwrap_or("eng");
+        let image_dir = self
+            .image_output_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
         let config = LiteParseConfig {
             output_format: OutputFormat::Markdown,
             ocr_enabled: self.ocr_enabled,
@@ -2133,6 +2151,10 @@ impl DocumentProcessor {
             num_workers: std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(1).max(1))
                 .unwrap_or(1),
+            // Extract and write embedded images (figures / charts) next to the
+            // output so a PPTX/DOCX comes back as text + image components.
+            extract_images: image_dir.is_some(),
+            image_output_dir: image_dir,
             ..Default::default()
         };
 
@@ -2543,6 +2565,16 @@ fn is_pdf_extension(ext: &str) -> bool {
 
 fn is_presentation_extension(ext: &str) -> bool {
     matches!(ext, "pptx" | "ppt" | "odp" | "key")
+}
+
+/// Whether LiteParse handles this format directly (PDF via PDFium, office
+/// formats via LibreOffice conversion). Plain images stay on the markitdown /
+/// OCR path.
+fn is_liteparse_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "pdf" | "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "xlsx" | "xls" | "ods"
+    )
 }
 
 /// Check if a PDF file is encrypted/password-protected.
@@ -3171,7 +3203,8 @@ fn convert_single_input(
             cmd.jobs,
             cmd.output.clone(),
         )
-        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
+        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
+        .with_image_output_dir(image_target_dir(cmd.output.as_deref()));
 
     let converted = processor.process(input)?;
 
@@ -3666,7 +3699,8 @@ fn process_file_for_batch(
             cmd.jobs,
             cmd.output.clone(),
         )
-        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone());
+        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
+        .with_image_output_dir(batch_image_dir(output_dir));
 
     match processor.process(file) {
         Ok(doc) => {
@@ -3896,6 +3930,26 @@ fn expand_path(path: PathBuf) -> Result<PathBuf> {
     } else {
         Ok(path)
     }
+}
+
+/// Resolve the directory where extracted embedded images should be written for
+/// a single-file `--output`. If `output` is a directory (or trailing slash) use
+/// it as-is; if it is a file, write images next to it; if unset, write none.
+fn image_target_dir(output: Option<&Path>) -> Option<PathBuf> {
+    let output = output?;
+    let expanded = expand_path(output.to_path_buf()).ok()?;
+    if expanded.is_dir() {
+        Some(expanded)
+    } else {
+        expanded.parent().map(Path::to_path_buf)
+    }
+}
+
+/// Resolve the directory where extracted embedded images are written in batch
+/// (directory) mode: the batch output dir if present, otherwise alongside the
+/// source (in-place).
+fn batch_image_dir(output_dir: Option<&PathBuf>) -> Option<PathBuf> {
+    output_dir.cloned()
 }
 
 fn expand_str_path(text: &str) -> Result<PathBuf> {
@@ -4973,5 +5027,29 @@ mod tests {
         assert!(!is_hidden_component(Some("..")));
         assert!(!is_hidden_component(Some("src")));
         assert!(!is_hidden_component(None));
+    }
+
+    #[test]
+    fn liteparse_extension_covers_pdf_and_office() {
+        assert!(is_liteparse_extension("pdf"));
+        assert!(is_liteparse_extension("pptx"));
+        assert!(is_liteparse_extension("key"));
+        assert!(is_liteparse_extension("docx"));
+        assert!(is_liteparse_extension("xlsx"));
+        assert!(!is_liteparse_extension("png"));
+        assert!(!is_liteparse_extension("html"));
+        assert!(!is_liteparse_extension("csv"));
+    }
+
+    #[test]
+    fn image_target_dir_resolves_file_parent_or_dir() {
+        // A file output: images go next to it.
+        let d = image_target_dir(Some(Path::new("/tmp/out/deck.md")));
+        assert_eq!(d.as_deref(), Some(Path::new("/tmp/out")));
+        // A directory output: images go in it.
+        let d = image_target_dir(Some(Path::new("/tmp/out/")));
+        assert_eq!(d.as_deref(), Some(Path::new("/tmp/out")));
+        // No output: no image writing.
+        assert!(image_target_dir(None).is_none());
     }
 }
