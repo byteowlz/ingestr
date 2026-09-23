@@ -69,7 +69,15 @@ Commands:
   config       Inspect and manage configuration
   cache        Inspect or clear the conversion cache
   completions  Generate shell completions
+  doctor       Report which external tools are installed
 ```
+
+### External dependencies
+
+PDF conversion and search need **no external tools** (LiteParse bundles PDFium
+and its OCR). Converting office formats (PPTX/DOCX/XLSX) requires **LibreOffice**
+(`soffice`); some OCR backends use Poppler (`pdftoppm`). Run `ingestr doctor` to
+see what is installed and what is missing.
 
 ### Converting documents
 

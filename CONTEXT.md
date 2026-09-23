@@ -153,5 +153,11 @@ _Avoid_: parser (generic), llama/liteparse name confusion
 
 **Office formats**:
 PPTX/DOCX/XLSX/PPT/ODP/KEY/DOC/ODT/XLS/ODS converted via LiteParse (LibreOffice
-→ text extraction + embedded-image extraction) rather than markitdown.
+→ text extraction + embedded-image extraction) rather than markitdown. Requires
+LibreOffice (`soffice`) to be installed; PDFs need no external tool.
 _Avoid_: office docs (ambiguous)
+
+**Doctor**:
+The `ingestr doctor` command reports which external tools are installed
+(LibreOffice, Poppler, Tesseract, ImageMagick, Python) and what each enables.
+_Avoid_: deps, requirements

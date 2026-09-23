@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ingestr doctor`**: reports which external tools are installed (LibreOffice, Poppler, Tesseract, ImageMagick, Python) and what each enables, with install instructions for any that are missing.
+- **Clear LibreOffice dependency**: office formats (PPTX/DOCX/XLSX) require LibreOffice; the converter now fails with an actionable message (pointing at `ingestr doctor`) instead of a cryptic error. PDFs need no external tool (PDFium is bundled).
 - **Office formats through LiteParse**: PPTX/DOCX/XLSX (and PPT/ODP/KEY/DOC/ODT/XLS/ODS) now convert via LiteParse instead of markitdown (whose PPTX path was broken). For a PPTX this extracts both per-slide text and embedded images; with `--output` the images are written as files alongside the Markdown, so a deck comes back as text + image components. PDFs still use LiteParse.
 - **Top-notch `convert` CLI**: rich help with worked examples, `--fail-fast` (stop at the first conversion error), TTY-gated color/progress (honoring `NO_COLOR`/`--no-color`), machine-mode `--json` contract (stdout always parseable, `ok`/`found`/`plans` envelopes, per-file results and errors), clean display-only error output, and a non-zero exit code when any file fails. `ingestr convert .` now converts every document in the cwd one-shot; add `--recursive` for subdirs.
 - **Bug fix**: a relative input like `ingestr convert .` no longer silently skips every file (the hidden-file filter treated the `.` current-dir component as hidden).

@@ -101,6 +101,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "config",
     "cache",
     "completions",
+    "doctor",
     "help",
 ];
 
@@ -138,6 +139,7 @@ fn try_main() -> Result<()> {
         Command::Config { command } => handle_config(&ctx, command),
         Command::Cache { command } => handle_cache(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
+        Command::Doctor => handle_doctor(),
     }
 }
 
@@ -239,6 +241,8 @@ enum Command {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Report which external tools are installed (doctor)
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2129,6 +2133,17 @@ impl DocumentProcessor {
     /// text plus embedded images. It replaces both the markitdown native path
     /// and the hand-rolled page routing.
     fn process_pdf_with_liteparse(&self, input: &Path) -> Result<ConvertedDocument> {
+        // Office formats are converted via LibreOffice; make a missing install
+        // a clear, actionable error instead of a cryptic failure.
+        if is_office_extension(extension_of(input)) && !has_libreoffice() {
+            bail!(
+                "LibreOffice is required to convert {} (see `ingestr doctor`). \
+                Install it with: apt-get install libreoffice (Debian/Ubuntu) \
+                or brew install --cask libreoffice (macOS)",
+                input.display()
+            );
+        }
+
         let path_str = input
             .to_str()
             .ok_or_else(|| anyhow!("invalid path encoding"))?;
@@ -2575,6 +2590,26 @@ fn is_liteparse_extension(ext: &str) -> bool {
         ext,
         "pdf" | "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "xlsx" | "xls" | "ods"
     )
+}
+
+/// Whether a format needs LibreOffice for conversion (office documents).
+fn is_office_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "xlsx" | "xls" | "ods"
+    )
+}
+
+/// Whether LibreOffice (`soffice`/`libreoffice`) is available on PATH.
+fn has_libreoffice() -> bool {
+    command_exists("soffice") || command_exists("libreoffice")
+}
+
+/// The lowercased file extension of a path, or an empty string.
+fn extension_of(path: &Path) -> &str {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
 }
 
 /// Check if a PDF file is encrypted/password-protected.
@@ -3836,6 +3871,74 @@ fn handle_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
+/// Whether an external command is present on PATH. Checks for the binary file
+/// rather than running it (some tools like poppler's pdftoppm exit non-zero on
+/// `--version`, which would misreport them as missing).
+fn command_exists(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path)
+        .any(|dir| dir.join(name).is_file() || dir.join(format!("{name}.exe")).is_file())
+}
+
+/// Report which external tools are installed so users know what conversions
+/// and OCR backends are available without a dependency being silently missing.
+fn handle_doctor() -> Result<()> {
+    let checks: Vec<(&str, bool, &str, &str)> = vec![
+        (
+            "LibreOffice (soffice)",
+            command_exists("soffice") || command_exists("libreoffice"),
+            "Required for PPTX/DOCX/XLSX conversion",
+            "Ubuntu: apt-get install libreoffice | macOS: brew install --cask libreoffice",
+        ),
+        (
+            "Poppler (pdftoppm)",
+            command_exists("pdftoppm"),
+            "Renders PDF pages to images (VLM/OCR paths)",
+            "Ubuntu: apt-get install poppler-utils",
+        ),
+        (
+            "Poppler (pdftotext)",
+            command_exists("pdftotext"),
+            "Native PDF text extraction fallback",
+            "Ubuntu: apt-get install poppler-utils",
+        ),
+        (
+            "Tesseract",
+            command_exists("tesseract"),
+            "OCR backend (tesseract); LiteParse bundles its own",
+            "Ubuntu: apt-get install tesseract-ocr",
+        ),
+        (
+            "ImageMagick (convert)",
+            command_exists("convert") || command_exists("magick"),
+            "Image -> PDF conversion (some pipelines)",
+            "Ubuntu: apt-get install imagemagick",
+        ),
+        (
+            "Python3",
+            command_exists("python3"),
+            "Required for surya / easyocr backends",
+            "Ubuntu: apt-get install python3",
+        ),
+    ];
+
+    println!("ingestr doctor — installed tooling\n");
+    for (name, ok, purpose, install) in checks {
+        let mark = if ok { "✓" } else { "✗" };
+        println!("{mark}  {name}");
+        println!("    {purpose}");
+        if !ok {
+            println!("    install: {install}");
+        }
+    }
+    println!();
+    println!("PDF conversion (LiteParse/PDFium) and search need no external tools.");
+    println!("LiteParse PDFium and Tesseract are bundled; LibreOffice is not.");
+    Ok(())
+}
+
 fn load_or_init_config(paths: &AppPaths, common: &CommonOpts) -> Result<AppConfig> {
     if !paths.active_config.exists() {
         if common.dry_run {
@@ -3938,7 +4041,10 @@ fn expand_path(path: PathBuf) -> Result<PathBuf> {
 fn image_target_dir(output: Option<&Path>) -> Option<PathBuf> {
     let output = output?;
     let expanded = expand_path(output.to_path_buf()).ok()?;
-    if expanded.is_dir() {
+    // A trailing separator marks an explicit directory even if it does not yet
+    // exist (so `--output out/` writes images into out/).
+    let explicit_dir = output.to_string_lossy().ends_with(['/', '\\']);
+    if expanded.is_dir() || explicit_dir {
         Some(expanded)
     } else {
         expanded.parent().map(Path::to_path_buf)
@@ -5039,6 +5145,21 @@ mod tests {
         assert!(!is_liteparse_extension("png"));
         assert!(!is_liteparse_extension("html"));
         assert!(!is_liteparse_extension("csv"));
+    }
+
+    #[test]
+    fn office_extension_requires_libreoffice() {
+        assert!(is_office_extension("pptx"));
+        assert!(is_office_extension("docx"));
+        assert!(is_office_extension("xlsx"));
+        assert!(!is_office_extension("pdf"));
+        assert!(!is_office_extension("png"));
+    }
+
+    #[test]
+    fn extension_of_falls_back_empty() {
+        assert_eq!(extension_of(Path::new("a/b/report.PDF")), "PDF");
+        assert_eq!(extension_of(Path::new("noext")), "");
     }
 
     #[test]
