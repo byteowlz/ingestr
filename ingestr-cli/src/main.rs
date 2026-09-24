@@ -23,6 +23,9 @@ use clap_complete::Shell;
 use config::{Config, Environment, File, FileFormat};
 use env_logger::fmt::WriteStyle;
 use ingestr_core::{IndexedDocument, SearchIndex};
+use liteparse::ocr::oar::OarOcrEngine;
+// Aliased: ingestr also imports `ocrs::OcrEngine` for the legacy image path.
+use liteparse::ocr::{OcrEngine as LiteOcrEngine, OcrOptions, OcrResult};
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat};
 use log::{LevelFilter, debug, error, info, warn};
 use markitdown::{MarkItDown, model::ConversionOptions};
@@ -91,6 +94,20 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// File extensions ingestr knows how to convert. Used as the default filter in
+/// directory (batch) mode so a mixed pile does not waste time on binaries,
+/// archives or other non-documents. Override with `--extensions` or
+/// `--all-files`.
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    // Documents (LiteParse: PDFium / LibreOffice)
+    "pdf", "pptx", "ppt", "odp", "key", "docx", "doc", "odt", "xlsx", "xls", "ods",
+    // Web / feeds / data (markitdown)
+    "html", "htm", "xhtml", "rss", "atom", "xml", "csv", "tsv", "json", "ipynb",
+    // Plain text
+    "txt", "md", "markdown", "rst", "log", // Images (OCR / VLM paths)
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
+];
 
 /// Known subcommand names (used for default-subcommand detection).
 const KNOWN_SUBCOMMANDS: &[&str] = &[
@@ -320,9 +337,14 @@ struct ConvertCommand {
     /// Recursively process directories
     #[arg(short, long)]
     recursive: bool,
-    /// File extensions to process (comma-separated, e.g., "pdf,docx,html")
+    /// File extensions to process (comma-separated, e.g., "pdf,docx,html").
+    /// Defaults to the set of known document formats; see --all-files.
     #[arg(long, value_name = "EXTENSIONS", value_delimiter = ',')]
     extensions: Option<Vec<String>>,
+    /// Attempt every file regardless of extension (disables the default
+    /// document-format allowlist; binaries will be reported as failures)
+    #[arg(long, conflicts_with = "extensions")]
+    all_files: bool,
     /// Write output files alongside source files (same directory) when processing
     /// directories. This is the default when no --output is specified.
     #[arg(long)]
@@ -342,8 +364,8 @@ struct ConvertCommand {
     /// Enable OCR processing for scanned documents
     #[arg(long)]
     ocr: bool,
-    /// OCR backend to use
-    #[arg(long, value_name = "BACKEND", value_enum, default_value = "ocrs")]
+    /// OCR backend to use (paddle = bundled PP-OCR ONNX engine, the default)
+    #[arg(long, value_name = "BACKEND", value_enum, default_value = "paddle")]
     ocr_backend: OcrBackend,
     /// OCR languages (comma-separated, e.g., "eng,deu")
     #[arg(long, value_name = "LANGS", value_delimiter = ',')]
@@ -378,6 +400,23 @@ struct ConvertCommand {
     /// Bypass the conversion cache
     #[arg(long)]
     no_cache: bool,
+    /// Conversion engine: auto (LiteParse for PDF/office, markitdown otherwise),
+    /// liteparse (no markitdown fallback for LiteParse formats), or markitdown
+    /// (skip LiteParse entirely). Useful for A/B comparisons and debugging.
+    #[arg(long, value_enum, default_value_t = ConvertEngine::Auto)]
+    engine: ConvertEngine,
+}
+
+/// Which conversion engine to use for a document.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default)]
+enum ConvertEngine {
+    /// LiteParse for PDF/office formats, markitdown for everything else.
+    #[default]
+    Auto,
+    /// Force LiteParse for its formats; fail instead of falling back.
+    Liteparse,
+    /// Skip LiteParse and use markitdown for everything.
+    Markitdown,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -417,8 +456,11 @@ impl InputFormat {
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum OcrBackend {
-    Tesseract,
+    /// PP-OCR (PaddleOCR family) via the bundled ONNX runtime. Models are
+    /// downloaded on first use. CPU-only, fast, permissive license.
     #[default]
+    Paddle,
+    Tesseract,
     Ocrs,
     Surya,
     Easyocr,
@@ -427,6 +469,7 @@ enum OcrBackend {
 impl std::fmt::Display for OcrBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Paddle => write!(f, "paddle"),
             Self::Tesseract => write!(f, "tesseract"),
             Self::Ocrs => write!(f, "ocrs"),
             Self::Surya => write!(f, "surya"),
@@ -903,10 +946,18 @@ impl Default for VlmConfig {
 struct OcrConfig {
     /// Enable OCR processing
     enabled: bool,
-    /// OCR backend (tesseract, ocrs, surya, easyocr)
+    /// OCR backend (paddle, tesseract, ocrs, surya, easyocr)
     backend: OcrBackend,
     /// Languages for OCR
     languages: Vec<String>,
+    /// PP-OCR model size for the paddle backend: tiny | small | medium.
+    /// Larger is more accurate and slower; models auto-download on first use.
+    paddle_model: String,
+    /// Also OCR PDF pages whose native text layer is merely sparse and that
+    /// carry no embedded images (recall-first). Off by default: such pages are
+    /// almost always short native-text pages, and OCR-ing them costs seconds
+    /// each for nothing. Scanned, text-less and garbled pages are always OCR'd.
+    ocr_sparse_pages: bool,
     /// Render DPI used when OCR-ing scanned pages.
     page_dpi: u32,
     /// Optional local OCR HTTP server URL (liteparse OCR API). When set, the
@@ -918,8 +969,10 @@ impl Default for OcrConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            backend: OcrBackend::Ocrs,
+            backend: OcrBackend::Paddle,
             languages: vec!["eng".to_string()],
+            paddle_model: "small".to_string(),
+            ocr_sparse_pages: false,
             page_dpi: 300,
             ocr_server_url: None,
         }
@@ -1690,31 +1743,41 @@ fn cache_dir() -> Result<PathBuf> {
 }
 
 /// Compute a cache key from file hash + conversion flags.
-fn cache_key(
-    path: &Path,
-    meta: bool,
-    raw: bool,
-    vlm: bool,
-    ocr: bool,
-    section: &Option<String>,
-    pages: &Option<String>,
-) -> Result<String> {
+/// Bump when conversion output changes for the same input+flags (new engine
+/// routing, new OCR default, changed post-processing) so stale cache entries
+/// are never served as hits.
+const CACHE_SCHEMA: &str = "ingestr-cache-v2";
+
+/// Compute a cache key from the file's content hash plus every option that can
+/// change the conversion result.
+fn cache_key(path: &Path, cmd: &ConvertCommand) -> Result<String> {
     let data = fs::read(path).context("reading file for cache key")?;
     let mut hasher = Sha256::new();
+    hasher.update(CACHE_SCHEMA.as_bytes());
     hasher.update(&data);
-    // Include flags in hash so different flag combos get different cache entries
-    hasher.update(if meta { b"meta=1" } else { b"meta=0" });
-    hasher.update(if raw { b"raw=1" } else { b"raw=0" });
-    hasher.update(if vlm { b"vlm=1" } else { b"vlm=0" });
-    hasher.update(if ocr { b"ocr=1" } else { b"ocr=0" });
-    if let Some(s) = section {
+    hasher.update(if cmd.meta { b"meta=1" } else { b"meta=0" });
+    hasher.update(if cmd.raw { b"raw=1" } else { b"raw=0" });
+    hasher.update(if cmd.vlm { b"vlm=1" } else { b"vlm=0" });
+    hasher.update(if cmd.ocr { b"ocr=1" } else { b"ocr=0" });
+    if cmd.ocr {
+        hasher.update(format!("ocr_backend={}", cmd.ocr_backend).as_bytes());
+        if let Some(langs) = &cmd.ocr_languages {
+            hasher.update(format!("ocr_langs={}", langs.join("+")).as_bytes());
+        }
+    }
+    if cmd.vlm
+        && let Some(model) = &cmd.vlm_model
+    {
+        hasher.update(format!("vlm_model={model}").as_bytes());
+    }
+    hasher.update(format!("engine={:?}", cmd.engine).as_bytes());
+    if let Some(s) = &cmd.section {
         hasher.update(format!("section={s}").as_bytes());
     }
-    if let Some(p) = pages {
+    if let Some(p) = &cmd.pages {
         hasher.update(format!("pages={p}").as_bytes());
     }
-    let hash = hasher.finalize();
-    Ok(hex::encode(hash))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Try to read a cached conversion result.
@@ -1943,6 +2006,8 @@ struct DocumentProcessor {
     /// / charts from a PPTX). `None` keeps image references in the Markdown
     /// without writing image files.
     image_output_dir: Option<PathBuf>,
+    /// Engine selection (auto / liteparse / markitdown).
+    engine: ConvertEngine,
 }
 
 impl DocumentProcessor {
@@ -1956,10 +2021,11 @@ impl DocumentProcessor {
             jobs: 1,
             vlm_output: None,
             ocr_enabled: false,
-            ocr_backend: OcrBackend::Ocrs,
+            ocr_backend: OcrBackend::Paddle,
             ocr_languages: vec!["eng".to_string()],
             ocr_page_dpi: 300,
             image_output_dir: None,
+            engine: ConvertEngine::Auto,
         }
     }
 
@@ -1999,6 +2065,11 @@ impl DocumentProcessor {
 
     fn with_image_output_dir(mut self, output_dir: Option<PathBuf>) -> Self {
         self.image_output_dir = output_dir;
+        self
+    }
+
+    fn with_engine(mut self, engine: ConvertEngine) -> Self {
+        self.engine = engine;
         self
     }
 
@@ -2140,11 +2211,19 @@ impl DocumentProcessor {
         // PPTX/DOCX/XLSX it converts via LibreOffice and extracts per-slide /
         // per-section text plus embedded images. This replaces markitdown for
         // these formats (markitdown's PPTX path is broken).
-        if is_liteparse_extension(&extension)
-            && let Ok(parsed) = self.process_pdf_with_liteparse(input)
-            && !parsed.text_content.trim().is_empty()
-        {
-            return Ok(parsed);
+        if self.engine != ConvertEngine::Markitdown && is_liteparse_extension(&extension) {
+            match self.process_pdf_with_liteparse(input) {
+                Ok(parsed) if !parsed.text_content.trim().is_empty() => return Ok(parsed),
+                Ok(_) if self.engine == ConvertEngine::Liteparse => {
+                    bail!("liteparse produced no text for {}", input.display());
+                }
+                Err(e) if self.engine == ConvertEngine::Liteparse => return Err(e),
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "liteparse failed on {}, falling back to markitdown: {e}",
+                    input.display()
+                ),
+            }
         }
 
         // Try markitdown first
@@ -2174,6 +2253,13 @@ impl DocumentProcessor {
             && !ocr_result.text_content.trim().is_empty()
         {
             return Ok(ocr_result);
+        }
+
+        if self.ocr_enabled && is_image_extension(&extension) {
+            bail!(
+                "no text found in {} (OCR produced no output)",
+                input.display()
+            );
         }
 
         // Fallback: try reading as text
@@ -2285,7 +2371,11 @@ impl DocumentProcessor {
     }
 
     fn process_with_ocr(&self, input: &Path) -> Result<ConvertedDocument> {
-        let text = run_ocr(input, self.ocr_backend, &self.ocr_languages)?;
+        let text = if self.ocr_backend == OcrBackend::Paddle {
+            run_paddle_on_image(input, &self.settings.processors.ocr.paddle_model)?
+        } else {
+            run_ocr(input, self.ocr_backend, &self.ocr_languages)?
+        };
 
         let title = input
             .file_stem()
@@ -2310,7 +2400,7 @@ impl DocumentProcessor {
     fn process_pdf_with_liteparse(&self, input: &Path) -> Result<ConvertedDocument> {
         // Office formats are converted via LibreOffice; make a missing install
         // a clear, actionable error instead of a cryptic failure.
-        if is_office_extension(extension_of(input)) && !has_libreoffice() {
+        if is_office_extension(&extension_of(input)) && !has_libreoffice() {
             bail!(
                 "LibreOffice is required to convert {} (see `ingestr doctor`). \
                 Install it with: apt-get install libreoffice (Debian/Ubuntu) \
@@ -2332,9 +2422,19 @@ impl DocumentProcessor {
             .image_output_dir
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
+        // OCR gating. Office documents always carry a native text layer after
+        // the LibreOffice conversion, and most PDFs do too, so only enable OCR
+        // when the cheap page classification says a page truly needs it (see
+        // `pdf_needs_ocr`). The gate is per document: once enabled, LiteParse
+        // OCRs every page it flags.
+        let ext = extension_of(input);
+        let ocr_enabled = self.ocr_enabled
+            && !is_office_extension(&ext)
+            && (ext != "pdf"
+                || pdf_needs_ocr(input, self.settings.processors.ocr.ocr_sparse_pages));
         let config = LiteParseConfig {
             output_format: OutputFormat::Markdown,
-            ocr_enabled: self.ocr_enabled,
+            ocr_enabled,
             ocr_language: map_ocr_lang(ocr_lang),
             ocr_server_url: self.settings.processors.ocr.ocr_server_url.clone(),
             dpi: self.ocr_page_dpi as f32,
@@ -2357,8 +2457,21 @@ impl DocumentProcessor {
             config.dpi
         );
         let rt = liteparse_runtime()?;
+        let mut parser = LiteParse::new(config);
+        // Default CPU OCR engine: PP-OCR via the bundled ONNX runtime. An
+        // explicit OCR server URL still wins; other backends fall back to
+        // LiteParse's built-in Tesseract for PDF pages.
+        if self.ocr_enabled
+            && self.ocr_backend == OcrBackend::Paddle
+            && self.settings.processors.ocr.ocr_server_url.is_none()
+        {
+            match paddle_engine(&self.settings.processors.ocr.paddle_model) {
+                Ok(engine) => parser = parser.with_ocr_engine(engine),
+                Err(e) => warn!("paddle OCR unavailable ({e}); falling back to built-in tesseract"),
+            }
+        }
         let result = rt
-            .block_on(LiteParse::new(config).parse(path_str))
+            .block_on(parser.parse(path_str))
             .with_context(|| format!("liteparse failed on {}", input.display()))?;
 
         info!(
@@ -2760,10 +2873,13 @@ fn is_presentation_extension(ext: &str) -> bool {
 /// Whether LiteParse handles this format directly (PDF via PDFium, office
 /// formats via LibreOffice conversion). Plain images stay on the markitdown /
 /// OCR path.
+/// Spreadsheets (`xlsx`/`xls`) are deliberately excluded: markitdown renders
+/// them as proper Markdown tables (header row, every sheet), where LiteParse's
+/// LibreOffice-to-PDF path loses the header row and flattens small sheets.
 fn is_liteparse_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "pdf" | "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "xlsx" | "xls" | "ods"
+        "pdf" | "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "ods"
     )
 }
 
@@ -2771,7 +2887,7 @@ fn is_liteparse_extension(ext: &str) -> bool {
 fn is_office_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "xlsx" | "xls" | "ods"
+        "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "ods"
     )
 }
 
@@ -2781,9 +2897,10 @@ fn has_libreoffice() -> bool {
 }
 
 /// The lowercased file extension of a path, or an empty string.
-fn extension_of(path: &Path) -> &str {
+fn extension_of(path: &Path) -> String {
     path.extension()
         .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_default()
 }
 
@@ -3443,6 +3560,7 @@ fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -> Result<St
 
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
+        OcrBackend::Paddle => run_paddle_on_image(input, "small"),
         OcrBackend::Ocrs => run_ocrs(input, languages),
         OcrBackend::Surya => {
             // Surya uses Python, call via python
@@ -3518,6 +3636,148 @@ fn map_ocr_lang(lang: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// Process-wide PP-OCR engine (PaddleOCR family via `oar-ocr`/ONNX). Built
+/// once and shared: model loading is the expensive part, and a batch run OCRs
+/// many pages/images with the same engine. The first call downloads the
+/// detection/recognition models and dictionary (SHA-256 verified) into
+/// `$OAR_HOME` (default `~/.oar`).
+fn paddle_engine(model: &str) -> Result<std::sync::Arc<OarOcrEngine>> {
+    static ENGINE: OnceLock<Result<std::sync::Arc<OarOcrEngine>, String>> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            let size = model.trim().to_ascii_lowercase();
+            info!("paddle: loading PP-OCRv6 {size} (models auto-download on first use)");
+            let built = match size.as_str() {
+                "tiny" => OarOcrEngine::ppocr_v6_tiny(),
+                "medium" => OarOcrEngine::ppocr_v6_medium(),
+                _ => OarOcrEngine::ppocr_v6_small(),
+            };
+            built.map(std::sync::Arc::new).map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(|e| anyhow!("initializing paddle OCR engine: {e}"))
+}
+
+/// OCR a standalone image with the PP-OCR engine and reassemble the word
+/// boxes into reading-order lines.
+fn run_paddle_on_image(input: &Path, model: &str) -> Result<String> {
+    let engine = paddle_engine(model)?;
+    let image = image::open(input)
+        .with_context(|| format!("reading image for paddle OCR: {}", input.display()))?
+        .into_rgb8();
+    let (width, height) = image.dimensions();
+    let options = OcrOptions {
+        language: "en".to_string(),
+        dpi: 300.0,
+    };
+    let rt = liteparse_runtime()?;
+    let results = rt
+        .block_on(engine.recognize(image.as_raw(), width, height, &options))
+        .map_err(|e| anyhow!("paddle OCR failed on {}: {e}", input.display()))?;
+    Ok(layout_ocr_results(results))
+}
+
+/// Turn unordered word-level OCR results into text: group boxes whose
+/// vertical centres are within about half a line height into one line, order
+/// lines top-to-bottom and words left-to-right.
+fn layout_ocr_results(mut results: Vec<OcrResult>) -> String {
+    results.retain(|r| !r.text.trim().is_empty());
+    if results.is_empty() {
+        return String::new();
+    }
+    let centre_y = |r: &OcrResult| (r.bbox[1] + r.bbox[3]) / 2.0;
+    let box_h = |r: &OcrResult| (r.bbox[3] - r.bbox[1]).abs().max(1.0);
+    results.sort_by(|a, b| centre_y(a).total_cmp(&centre_y(b)));
+
+    let mut lines: Vec<Vec<OcrResult>> = Vec::new();
+    let mut line_y = centre_y(&results[0]);
+    let mut line_h = box_h(&results[0]);
+    for r in results {
+        let same_line = (centre_y(&r) - line_y).abs() <= 0.6 * line_h.max(box_h(&r));
+        if same_line && !lines.is_empty() {
+            if let Some(last) = lines.last_mut() {
+                last.push(r);
+            }
+        } else {
+            line_y = centre_y(&r);
+            line_h = box_h(&r);
+            lines.push(vec![r]);
+        }
+    }
+
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.sort_by(|a, b| a.bbox[0].total_cmp(&b.bbox[0]));
+            line.iter()
+                .map(|r| r.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Per-page OCR decision from LiteParse's classification: OCR when the page is
+/// scanned, has no text layer, or its text is garbled; a text-sparse page only
+/// when it also carries embedded images (a scan with a small text stamp) or the
+/// caller asked for recall-first behaviour. Pure sparse-text pages are short
+/// native-text pages. Unknown reasons are ignored (LiteParse may add variants).
+fn page_needs_ocr(
+    flagged: bool,
+    reasons: &[liteparse::ocr_merge::ComplexityReason],
+    ocr_sparse_pages: bool,
+) -> bool {
+    use liteparse::ocr_merge::ComplexityReason as R;
+    if !flagged {
+        return false;
+    }
+    let has = |pred: fn(&R) -> bool| reasons.iter().any(pred);
+    let hard = has(|r| matches!(r, R::Scanned | R::NoText | R::Garbled));
+    let sparse = has(|r| matches!(r, R::SparseText));
+    let images = has(|r| matches!(r, R::EmbeddedImages));
+    hard || (sparse && (images || ocr_sparse_pages))
+}
+
+/// Whether a PDF needs OCR at all, decided from a cheap classification pass
+/// (no rendering, no model). Classification failures return `true` so OCR is
+/// never skipped by mistake.
+fn pdf_needs_ocr(path: &Path, ocr_sparse_pages: bool) -> bool {
+    let Some(path_str) = path.to_str() else {
+        return true;
+    };
+    let Ok(rt) = liteparse_runtime() else {
+        return true;
+    };
+    let probe = LiteParse::new(LiteParseConfig {
+        ocr_enabled: false,
+        quiet: true,
+        ..Default::default()
+    });
+    let input = liteparse::types::PdfInput::Path(path_str.to_string());
+    let stats = match rt.block_on(probe.is_complex(input)) {
+        Ok(stats) => stats,
+        Err(e) => {
+            warn!(
+                "page classification failed for {}; OCR-ing anyway: {e}",
+                path.display()
+            );
+            return true;
+        }
+    };
+    let needed = stats
+        .iter()
+        .any(|page| page_needs_ocr(page.needs_ocr, &page.reasons, ocr_sparse_pages));
+    if !needed {
+        debug!(
+            "OCR skipped for {}: {} page(s), none scanned/text-less/garbled",
+            path.display(),
+            stats.len()
+        );
+    }
+    needed
 }
 
 fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
@@ -3604,15 +3864,7 @@ fn convert_single_input(
     if !cmd.no_cache
         && !cmd.toc
         && input.exists()
-        && let Ok(key) = cache_key(
-            input,
-            cmd.meta,
-            cmd.raw,
-            cmd.vlm,
-            cmd.ocr,
-            &cmd.section,
-            &cmd.pages,
-        )
+        && let Ok(key) = cache_key(input, cmd)
         && let Ok(Some(cached)) = cache_get(&key)
     {
         debug!("cache hit for {source_label}");
@@ -3628,7 +3880,8 @@ fn convert_single_input(
             cmd.output.clone(),
         )
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
-        .with_image_output_dir(image_target_dir(cmd.output.as_deref()));
+        .with_image_output_dir(image_target_dir(cmd.output.as_deref()))
+        .with_engine(cmd.engine);
 
     let converted = processor.process(input)?;
 
@@ -3735,15 +3988,7 @@ fn convert_single_input(
         && cmd.max_tokens.is_none()
         && cmd.max_chars.is_none()
         && cmd.offset == 0
-        && let Ok(key) = cache_key(
-            input,
-            cmd.meta,
-            cmd.raw,
-            cmd.vlm,
-            cmd.ocr,
-            &cmd.section,
-            &cmd.pages,
-        )
+        && let Ok(key) = cache_key(input, cmd)
     {
         let _ = cache_put(&key, &final_output);
     }
@@ -3870,10 +4115,26 @@ fn handle_convert_directory(
         WalkDir::new(input_dir).max_depth(1)
     };
 
-    let extensions: Option<Vec<String>> = cmd
-        .extensions
-        .clone()
-        .map(|exts| exts.iter().map(|e| e.to_lowercase()).collect());
+    // Extension filter: explicit --extensions wins; otherwise default to the
+    // known document formats so a mixed pile does not spend time (and report
+    // failures) on binaries, archives and other non-documents. --all-files
+    // disables the filter entirely.
+    let extensions: Option<Vec<String>> = if cmd.all_files {
+        None
+    } else if let Some(exts) = &cmd.extensions {
+        Some(
+            exts.iter()
+                .map(|e| e.trim_start_matches('.').to_lowercase())
+                .collect(),
+        )
+    } else {
+        Some(
+            SUPPORTED_EXTENSIONS
+                .iter()
+                .map(|e| (*e).to_string())
+                .collect(),
+        )
+    };
 
     let files: Vec<PathBuf> = walker
         .into_iter()
@@ -3975,6 +4236,7 @@ fn handle_convert_directory(
         parallel == 1 && !ctx.common.quiet && !ctx.common.no_progress && stderr_tty && color_ok;
 
     let converted = AtomicUsize::new(0);
+    let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -3995,6 +4257,7 @@ fn handle_convert_directory(
                             cmd,
                             in_place,
                             &converted,
+                            &skipped,
                             &failed,
                             &errors,
                         )
@@ -4023,6 +4286,7 @@ fn handle_convert_directory(
                 cmd,
                 in_place,
                 &converted,
+                &skipped,
                 &failed,
                 &errors,
             );
@@ -4054,7 +4318,7 @@ fn handle_convert_directory(
     let stats = ConvertStats {
         total,
         converted: converted.load(Ordering::Relaxed),
-        skipped: 0,
+        skipped: skipped.load(Ordering::Relaxed),
         failed: failed.load(Ordering::Relaxed),
         errors: errors.into_inner().unwrap_or_default(),
     };
@@ -4082,6 +4346,7 @@ fn handle_convert_directory(
             println!("\nConversion complete:");
             println!("  Total files: {}", stats.total);
             println!("  Converted:   {}", stats.converted);
+            println!("  Skipped:     {} (cached)", stats.skipped);
             println!("  Failed:      {}", stats.failed);
             if !stats.errors.is_empty() {
                 println!("\nErrors:");
@@ -4104,6 +4369,28 @@ fn handle_convert_directory(
     Ok(())
 }
 
+/// Resolve the batch output path for a source file: in-place (source dir),
+/// under the output dir (mirroring the relative path), or stdout (`-`).
+fn batch_output_path(
+    file: &Path,
+    input_dir: &Path,
+    output_dir: Option<&PathBuf>,
+    in_place: bool,
+) -> PathBuf {
+    if in_place {
+        let mut out = file.to_path_buf();
+        out.set_extension("md");
+        out
+    } else if let Some(out_dir) = output_dir {
+        let relative = file.strip_prefix(input_dir).unwrap_or(file);
+        let mut out = out_dir.join(relative);
+        out.set_extension("md");
+        out
+    } else {
+        PathBuf::from("-")
+    }
+}
+
 fn process_file_for_batch(
     file: &Path,
     input_dir: &Path,
@@ -4112,9 +4399,44 @@ fn process_file_for_batch(
     cmd: &ConvertCommand,
     in_place: bool,
     converted: &AtomicUsize,
+    skipped: &AtomicUsize,
     failed: &AtomicUsize,
     errors: &std::sync::Mutex<Vec<String>>,
 ) -> Result<ConvertResult> {
+    let output_path = batch_output_path(file, input_dir, output_dir, in_place);
+
+    // Resume: reuse a cached conversion keyed by content hash + flags. This
+    // makes re-running a large batch after an interruption cheap, and shared
+    // or re-converted documents reuse their prior result. Write the cached
+    // Markdown to the output path if it is missing so the on-disk tree is
+    // complete even after a crash mid-run.
+    if !cmd.no_cache
+        && let Ok(key) = cache_key(file, cmd)
+        && let Ok(Some(cached)) = cache_get(&key)
+    {
+        let writes_file = in_place || output_dir.is_some();
+        if writes_file && !output_path.exists() {
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&output_path, &cached)?;
+        }
+        skipped.fetch_add(1, Ordering::Relaxed);
+        debug!("cache hit, skipped {}", file.display());
+        let source_modified = fs::metadata(file)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(system_time_to_rfc3339);
+        return Ok(ConvertResult {
+            source_path: file.display().to_string(),
+            output_path: output_path.display().to_string(),
+            source_modified,
+            title: None,
+            converted_at: "cached".to_string(),
+            markdown: cached,
+        });
+    }
+
     let processor = DocumentProcessor::new(settings.clone())
         .with_vlm(
             cmd.vlm,
@@ -4124,24 +4446,11 @@ fn process_file_for_batch(
             cmd.output.clone(),
         )
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
-        .with_image_output_dir(batch_image_dir(output_dir));
+        .with_image_output_dir(batch_image_dir(output_dir))
+        .with_engine(cmd.engine);
 
     match processor.process(file) {
         Ok(doc) => {
-            // Determine output path: in-place (source dir), output dir, or stdout
-            let output_path = if in_place {
-                let mut out = file.to_path_buf();
-                out.set_extension("md");
-                out
-            } else if let Some(out_dir) = output_dir {
-                let relative = file.strip_prefix(input_dir).unwrap_or(file);
-                let mut out = out_dir.join(relative);
-                out.set_extension("md");
-                out
-            } else {
-                PathBuf::from("-")
-            };
-
             let converted_at = OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "unknown".to_string());
@@ -4178,6 +4487,13 @@ fn process_file_for_batch(
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&output_path, &markdown)?;
+            }
+
+            // Populate the resume cache so a re-run skips this file.
+            if !cmd.no_cache
+                && let Ok(key) = cache_key(file, cmd)
+            {
+                let _ = cache_put(&key, &markdown);
             }
 
             converted.fetch_add(1, Ordering::Relaxed);
@@ -4324,7 +4640,10 @@ fn handle_doctor() -> Result<()> {
     }
     println!();
     println!("PDF conversion (LiteParse/PDFium) and search need no external tools.");
-    println!("LiteParse PDFium and Tesseract are bundled; LibreOffice is not.");
+    println!(
+        "Bundled: PDFium, PP-OCR (paddle, default OCR; models auto-download to ~/.oar), \
+         Tesseract. Not bundled: LibreOffice."
+    );
     Ok(())
 }
 
@@ -5170,7 +5489,7 @@ mod tests {
     fn ocr_config_default() {
         let config = OcrConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.backend, OcrBackend::Ocrs);
+        assert_eq!(config.backend, OcrBackend::Paddle);
         assert_eq!(config.languages, vec!["eng"]);
     }
 
@@ -5532,7 +5851,9 @@ mod tests {
         assert!(is_liteparse_extension("pptx"));
         assert!(is_liteparse_extension("key"));
         assert!(is_liteparse_extension("docx"));
-        assert!(is_liteparse_extension("xlsx"));
+        // Spreadsheets go to markitdown (better tables, no LibreOffice needed).
+        assert!(!is_liteparse_extension("xlsx"));
+        assert!(!is_liteparse_extension("xls"));
         assert!(!is_liteparse_extension("png"));
         assert!(!is_liteparse_extension("html"));
         assert!(!is_liteparse_extension("csv"));
@@ -5542,15 +5863,70 @@ mod tests {
     fn office_extension_requires_libreoffice() {
         assert!(is_office_extension("pptx"));
         assert!(is_office_extension("docx"));
-        assert!(is_office_extension("xlsx"));
+        assert!(!is_office_extension("xlsx"));
         assert!(!is_office_extension("pdf"));
         assert!(!is_office_extension("png"));
     }
 
     #[test]
     fn extension_of_falls_back_empty() {
-        assert_eq!(extension_of(Path::new("a/b/report.PDF")), "PDF");
+        assert_eq!(extension_of(Path::new("a/b/report.PDF")), "pdf");
+        assert_eq!(extension_of(Path::new("deck.PpTx")), "pptx");
         assert_eq!(extension_of(Path::new("noext")), "");
+    }
+
+    #[test]
+    fn page_needs_ocr_rule() {
+        use liteparse::ocr_merge::ComplexityReason as R;
+        // Not flagged by LiteParse at all: never OCR.
+        assert!(!page_needs_ocr(false, &[R::Scanned], false));
+        // Hard cases always OCR.
+        assert!(page_needs_ocr(true, &[R::Scanned], false));
+        assert!(page_needs_ocr(true, &[R::NoText], false));
+        assert!(page_needs_ocr(true, &[R::Garbled], false));
+        // Pure sparse text is a short native page: skip unless recall-first.
+        assert!(!page_needs_ocr(true, &[R::SparseText], false));
+        assert!(page_needs_ocr(true, &[R::SparseText], true));
+        // Sparse text over embedded images (a scan with a stamp): OCR.
+        assert!(page_needs_ocr(
+            true,
+            &[R::SparseText, R::EmbeddedImages],
+            false
+        ));
+        // Images alongside real text: no OCR.
+        assert!(!page_needs_ocr(true, &[R::EmbeddedImages], false));
+    }
+
+    #[test]
+    fn ocr_backend_default_is_paddle() {
+        assert_eq!(OcrBackend::default(), OcrBackend::Paddle);
+        assert_eq!(OcrConfig::default().backend, OcrBackend::Paddle);
+        assert_eq!(OcrConfig::default().paddle_model, "small");
+        let parsed: OcrBackend = serde_json::from_str("\"paddle\"").unwrap();
+        assert_eq!(parsed, OcrBackend::Paddle);
+    }
+
+    fn ocr_box(text: &str, x1: f32, y1: f32, x2: f32, y2: f32) -> OcrResult {
+        OcrResult {
+            text: text.to_string(),
+            bbox: [x1, y1, x2, y2],
+            confidence: 0.9,
+            polygon: None,
+        }
+    }
+
+    #[test]
+    fn layout_ocr_results_groups_lines_and_orders_words() {
+        // Two lines; words supplied out of order, second line slightly skewed.
+        let results = vec![
+            ocr_box("world", 60.0, 10.0, 100.0, 30.0),
+            ocr_box("total", 60.0, 52.0, 100.0, 72.0),
+            ocr_box("Hello", 10.0, 10.0, 50.0, 30.0),
+            ocr_box("Invoice", 10.0, 50.0, 50.0, 70.0),
+            ocr_box("  ", 200.0, 10.0, 210.0, 30.0),
+        ];
+        assert_eq!(layout_ocr_results(results), "Hello world\nInvoice total");
+        assert_eq!(layout_ocr_results(Vec::new()), "");
     }
 
     #[test]

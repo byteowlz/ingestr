@@ -44,8 +44,16 @@ model = "gpt-4o"
 [processors.ocr]
 # Enable OCR processing (as a fallback for scanned or image-only inputs)
 enabled = false
-# OCR backend: tesseract, ocrs, surya, easyocr
-backend = "ocrs"
+# OCR backend: paddle (default; bundled PP-OCR ONNX engine, CPU-only),
+# tesseract, ocrs, surya, easyocr
+backend = "paddle"
+# PP-OCR model size for the paddle backend: tiny | small | medium.
+# Models are downloaded on first use into $OAR_HOME (default ~/.oar).
+paddle_model = "small"
+# Also OCR PDF pages that merely have a sparse native text layer (no embedded
+# images). Off by default: those are short native-text pages and OCR-ing them
+# costs seconds each. Scanned / text-less / garbled pages are always OCR'd.
+ocr_sparse_pages = false
 # Languages for OCR (passed to the backend)
 languages = ["eng"]
 # Render DPI used when OCR-ing scanned pages.
