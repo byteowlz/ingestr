@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Batch resume**: directory conversion now uses the content-hash conversion cache. Re-running an interrupted or repeated batch skips already-converted files (reported as `skipped`) and re-materialises missing output files from the cache instead of re-converting. Identical documents at different paths are converted once. Failures are not cached, so they are retried on the next run. The cache key covers the content hash plus every option that changes the result (engine, OCR backend and languages, VLM model, section/page selection) and a schema version, so a routing or engine change never serves stale output.
+- **Default document allowlist for batch mode**: `ingestr convert <dir>` now only attempts known document formats (PDF, office, HTML/XML/feeds, CSV/TSV/JSON, text/Markdown, images) instead of every file. Binaries, archives and other non-documents are skipped rather than reported as failures. Override with `--extensions ...` or `--all-files`.
+- **PP-OCR (PaddleOCR family) is the default OCR backend** (`--ocr-backend paddle`, `[processors.ocr].backend = "paddle"`), via LiteParse's bundled ONNX runtime. It is CPU-only, permissively licensed and several times faster than the previous `ocrs` default, and is used both for scanned PDF pages and standalone images. Models (PP-OCRv6; size selectable with `paddle_model = tiny|small|medium`) are downloaded on first use into `~/.oar`. Tesseract/ocrs/surya/easyocr remain available.
+- **`--ocr` no longer OCRs office documents**: PPTX/DOCX converted via LibreOffice always have a native text layer, so their text-sparse pages are not sent to OCR any more (previously several seconds per slide for no gain). OCR applies to PDFs and images.
+- **`--ocr` skips PDF pages that only have a sparse native text layer**: before OCR-ing a PDF, ingestr runs LiteParse's cheap page classification and enables OCR only when a page is scanned, has no text layer, is garbled, or is text-sparse *with* embedded images. Short native-text PDFs (a one-paragraph memo) are no longer OCR'd. Set `[processors.ocr].ocr_sparse_pages = true` for recall-first behaviour.
+- Images that yield no text under `--ocr` now fail with a clear `no text found (OCR produced no output)` message instead of a generic converter error.
+- **`--engine auto|liteparse|markitdown`** on `convert` to force a conversion engine, for A/B comparisons and debugging. The engine is part of the cache key.
+
+### Changed
+
+- **Spreadsheets (`xlsx`/`xls`) are converted by markitdown again** rather than LiteParse: markitdown emits proper Markdown tables (header row, every sheet) and needs no LibreOffice, whereas the LiteParse path dropped the header row and flattened small sheets. PPTX/DOCX stay on LiteParse.
+- Transitive `ort` (ONNX Runtime) is pinned to `2.0.0-rc.12` in `Cargo.lock` because `oar-ocr 0.8` does not build against rc.13; `scripts/drift-check.sh` enforces the pin.
+- `markitdown` is applied as a vendored patch (`vendor/markitdown`, via `[patch.crates-io]`): identical to 0.1.11 except that its library-level debug `println!`s are routed through `log::debug!`, which previously corrupted stdout and broke `--json` for spreadsheets. See `vendor/markitdown/PATCH.md`.
+
 - **`ingestr doctor`**: reports which external tools are installed (LibreOffice, Poppler, Tesseract, ImageMagick, Python) and what each enables, with install instructions for any that are missing.
 - **Clear LibreOffice dependency**: office formats (PPTX/DOCX/XLSX) require LibreOffice; the converter now fails with an actionable message (pointing at `ingestr doctor`) instead of a cryptic error. PDFs need no external tool (PDFium is bundled).
 - **Office formats through LiteParse**: PPTX/DOCX/XLSX (and PPT/ODP/KEY/DOC/ODT/XLS/ODS) now convert via LiteParse instead of markitdown (whose PPTX path was broken). For a PPTX this extracts both per-slide text and embedded images; with `--output` the images are written as files alongside the Markdown, so a deck comes back as text + image components. PDFs still use LiteParse.

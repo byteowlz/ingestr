@@ -152,10 +152,29 @@ Supports an `ocr_server_url` HTTP OCR seam and `oar-ocr` GPU features.
 _Avoid_: parser (generic), llama/liteparse name confusion
 
 **Office formats**:
-PPTX/DOCX/XLSX/PPT/ODP/KEY/DOC/ODT/XLS/ODS converted via LiteParse (LibreOffice
-→ text extraction + embedded-image extraction) rather than markitdown. Requires
-LibreOffice (`soffice`) to be installed; PDFs need no external tool.
+PPTX/DOCX/PPT/ODP/KEY/DOC/ODT/ODS converted via LiteParse (LibreOffice → text
+extraction + embedded-image extraction). Requires LibreOffice (`soffice`).
+Spreadsheets (XLSX/XLS) are converted by markitdown instead (better tables, no
+LibreOffice). PDFs need no external tool.
 _Avoid_: office docs (ambiguous)
+
+**Paddle OCR**:
+The default OCR Backend (`paddle`): PP-OCR models from the PaddleOCR family run
+on a bundled ONNX runtime (via LiteParse's `oar-ocr`), CPU-only. Used for
+scanned PDF pages and standalone images; models auto-download to `~/.oar`.
+_Avoid_: PaddleOCR-VL (that is the separate GPU-tier vision model)
+
+**Resume Cache**:
+The content-hash conversion Cache as used by batch conversion: a re-run skips
+files whose content and conversion flags were already converted (`skipped` in
+the stats) and re-creates missing outputs from the cache. Failures are not
+cached.
+_Avoid_: incremental mode
+
+**Engine**:
+The converter selected for a Document: `auto` (LiteParse for PDF/office,
+markitdown otherwise), or forced via `--engine liteparse|markitdown`.
+_Avoid_: backend (that is the OCR engine choice)
 
 **Doctor**:
 The `ingestr doctor` command reports which external tools are installed

@@ -4,7 +4,8 @@ A background service that watches directories for documents, converts them to Ma
 
 ## Features
 
-- **Document Conversion**: Automatically converts documents (PDF, DOCX, XLSX, PPTX, HTML, etc.) to Markdown. PDFs and office formats (PPTX/DOCX/XLSX) use [LiteParse](https://github.com/run-llama/liteparse) (fast native extraction + page-aware OCR merge + embedded-image extraction); other formats use [markitdown](https://crates.io/crates/markitdown).
+- **Document Conversion**: Automatically converts documents (PDF, DOCX, XLSX, PPTX, HTML, etc.) to Markdown. PDFs and presentations/documents (PPTX/DOCX) use [LiteParse](https://github.com/run-llama/liteparse) (fast native extraction + page-aware OCR merge + embedded-image extraction); spreadsheets and other formats use [markitdown](https://crates.io/crates/markitdown).
+- **OCR for scanned pages and images**: PP-OCR (PaddleOCR family) via a bundled ONNX runtime by default, CPU-only; models download on first use. Tesseract and other backends are available.
 - **Full-Text Search**: Indexes converted documents with [Tantivy](https://github.com/quickwit-oss/tantivy) for fast search
 - **Background Service**: Runs as a daemon watching for file changes
 - **MCP Server**: Exposes search functionality to AI assistants via the Model Context Protocol
@@ -74,10 +75,11 @@ Commands:
 
 ### External dependencies
 
-PDF conversion and search need **no external tools** (LiteParse bundles PDFium
-and its OCR). Converting office formats (PPTX/DOCX/XLSX) requires **LibreOffice**
-(`soffice`); some OCR backends use Poppler (`pdftoppm`). Run `ingestr doctor` to
-see what is installed and what is missing.
+PDF conversion, spreadsheets, OCR and search need **no external tools**: LiteParse
+bundles PDFium, and the default `paddle` OCR backend bundles an ONNX runtime
+(PP-OCR models are downloaded on first use into `~/.oar`). Converting PPTX/DOCX
+requires **LibreOffice** (`soffice`); some optional OCR backends use Poppler
+(`pdftoppm`). Run `ingestr doctor` to see what is installed and what is missing.
 
 ### Converting documents
 
@@ -100,6 +102,12 @@ ingestr convert . --recursive --output out/
 ingestr convert . --recursive --dry-run
 ingestr convert . --recursive --json
 ```
+
+Batch runs are resumable: converted files are cached by content hash, so
+re-running after an interruption only converts what is new or changed (and
+re-creates missing outputs from the cache). By default only known document
+formats are attempted; use `--extensions pdf,docx` to narrow, `--all-files` to
+try everything, and `--engine liteparse|markitdown` to force an engine.
 
 ### Service Commands
 

@@ -62,6 +62,26 @@ sys.exit(failed)
 PY
 FAILED=$?
 
+echo "==> ort pinned to 2.0.0-rc.12 (oar-ocr 0.8 / liteparse compatibility)"
+# oar-ocr-core 0.8.x declares `ort ^2.0.0-rc.12` but does not compile against
+# rc.13 (removed CPUExecutionProvider). Cargo treats rc pre-releases as
+# compatible, so a plain `cargo update` re-breaks the build. The pin lives in
+# Cargo.lock; this check makes an accidental bump fail loudly.
+if python3 - <<'PY'
+import re, sys
+lock = open('Cargo.lock').read()
+m = re.search(r'name = "ort"\nversion = "([^"]+)"', lock)
+if not m:
+    print("  io: ort not in Cargo.lock (nothing to check)")
+    sys.exit(0)
+if m.group(1) != "2.0.0-rc.12":
+    print(f"  FAIL: ort is {m.group(1)}; expected 2.0.0-rc.12 "
+          "(run: cargo update -p ort --precise 2.0.0-rc.12)")
+    sys.exit(1)
+print("  ok: ort = 2.0.0-rc.12")
+PY
+then :; else FAILED=1; fi
+
 echo "==> Workspace resolves (cargo metadata)"
 if cargo metadata --no-deps --format-version 1 >/dev/null 2>&1; then
   echo "  ok: cargo metadata resolves"

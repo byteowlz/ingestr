@@ -1,6 +1,16 @@
 [workspace]
 members = ["ingestr-cli", "ingestr-core", "ingestr-mcp"]
+# The vendored markitdown patch is third-party code: keep it out of the
+# workspace so our strict lints do not apply to it (see vendor/markitdown/PATCH.md).
+exclude = ["vendor/markitdown"]
 resolver = "3"
+
+# Local patch of the markitdown crate: identical to 0.1.11 on crates.io except
+# that debug `println!`s in library code are routed through `log::debug!`, so
+# they no longer corrupt ingestr's stdout / `--json` output. See
+# vendor/markitdown/PATCH.md for the exact delta and how to refresh it.
+[patch.crates-io]
+markitdown = { path = "vendor/markitdown" }
 
 [workspace.package]
 version = "0.3.5"
@@ -37,7 +47,12 @@ arboard = "3"
 lopdf = "0.35"
 ocrs = "0.12.1"
 rten = "0.24.0"
-liteparse = "2"
+# `oar-ocr-auto-download` enables the native ONNX PP-OCR engine (PaddleOCR
+# family) as the CPU OCR default; models are downloaded on first use.
+# NOTE: transitive `ort` must stay at 2.0.0-rc.12 (oar-ocr 0.8 does not build
+# against rc.13). The pin is in Cargo.lock and enforced by
+# scripts/drift-check.sh; restore with `cargo update -p ort --precise 2.0.0-rc.12`.
+liteparse = { version = "2", features = ["oar-ocr-auto-download"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 image = "0.25"
 tempfile = "3"
