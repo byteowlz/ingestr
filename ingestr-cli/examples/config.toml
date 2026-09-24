@@ -59,3 +59,13 @@ enabled = false
 # model = "gpt-4o"
 # llm_url = "http://localhost:11434/v1"
 # prompts = { default = "Describe this image in detail." }
+
+# Semantic tier-router seam (System One / kev). This is a SPIKE seam: it routes
+# each document/page to one of a small closed set of ingestion tiers using a
+# local System-One decision model served over HTTP (e.g. `jaredpalmer/kev`
+# serving `POST /v1/systemone`). See docs/research/2026-ocr-vlm-semantic-router.md.
+[routing]
+# mode = "heuristic"  # heuristic (default, deterministic) | shadow | route
+# router_url = "http://localhost:8009"  # System-One base URL; required for shadow/route
+# model = "kev-latest"
+# api_key = "sk-..."
