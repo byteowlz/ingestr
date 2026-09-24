@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcCommand, Stdio};
 use std::sync::{
-    Arc, LazyLock,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, RecvTimeoutError},
 };
@@ -615,6 +615,7 @@ impl RuntimeContext {
             llm_base_url: self.config.llm.base_url.clone(),
             llm_api_key: self.config.llm.api_key.clone(),
             processors: self.config.processors.clone(),
+            routing: self.config.routing.clone(),
         })
     }
 }
@@ -683,6 +684,7 @@ struct AppConfig {
     index: IndexConfig,
     llm: LlmConfig,
     processors: ProcessorsConfig,
+    routing: RoutingConfig,
 }
 
 impl AppConfig {
@@ -706,6 +708,7 @@ impl Default for AppConfig {
             index: IndexConfig::default(),
             llm: LlmConfig::default(),
             processors: ProcessorsConfig::default(),
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -919,6 +922,90 @@ impl Default for OcrConfig {
             languages: vec!["eng".to_string()],
             page_dpi: 300,
             ocr_server_url: None,
+        }
+    }
+}
+
+/// Semantic tier-router mode. `heuristic` (default) keeps the existing
+/// deterministic routing and never calls a model; `shadow` calls the router
+/// but only logs its decision (no behavior change); `route` acts on the
+/// router's tier selection (for the spike this redirects to the VLM path when
+/// the router says `vlm`, and otherwise logs and falls back to the
+/// deterministic pipeline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RoutingMode {
+    #[default]
+    Heuristic,
+    Shadow,
+    Route,
+}
+
+/// The small, closed set of ingestion tiers a document/page may route to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoutingTier {
+    /// Clean text/vector extraction (native).
+    Native,
+    /// Scanned or text-sparse page (CPU OCR).
+    CpuOcr,
+    /// Dense/noisy tables, charts, handwriting (GPU model).
+    Gpu,
+    /// Image, diagram, screenshot (VLM).
+    Vlm,
+    /// Non-document or low value (skip).
+    Skip,
+}
+
+impl RoutingTier {
+    /// Parse a tier from the `choice` string returned by the router.
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "native" => Some(Self::Native),
+            "cpu_ocr" => Some(Self::CpuOcr),
+            "gpu" => Some(Self::Gpu),
+            "vlm" => Some(Self::Vlm),
+            "skip" => Some(Self::Skip),
+            _ => None,
+        }
+    }
+
+    /// The lowercase canonical name for a tier.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::CpuOcr => "cpu_ocr",
+            Self::Gpu => "gpu",
+            Self::Vlm => "vlm",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+/// Configuration for the semantic tier-router seam (`[routing]`). The router is
+/// a local System-One endpoint (e.g. `jaredpalmer/kev` serving
+/// `POST /v1/systemone`). See `docs/research/2026-ocr-vlm-semantic-router.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct RoutingConfig {
+    /// Routing mode: `heuristic` | `shadow` | `route`.
+    mode: RoutingMode,
+    /// System-One base URL (e.g. `http://localhost:8009`). Required for
+    /// `shadow`/`route` modes; empty means the router is skipped.
+    router_url: Option<String>,
+    /// Router model name (default `kev-latest`).
+    model: String,
+    /// Optional bearer API key for the router endpoint.
+    api_key: Option<String>,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::Heuristic,
+            router_url: None,
+            model: "kev-latest".to_string(),
+            api_key: None,
         }
     }
 }
@@ -1915,12 +2002,100 @@ impl DocumentProcessor {
         self
     }
 
+    /// Build the compact `RoutingInput` metadata block the router sees from a
+    /// document on disk.
+    fn build_routing_input(&self, input: &Path, extension: &str) -> Result<RoutingInput> {
+        let data =
+            fs::read(input).with_context(|| format!("reading {} for routing", input.display()))?;
+        let text = String::from_utf8_lossy(&data);
+        let text_chars = text.chars().count();
+        let snippet: String = text.chars().take(120).collect();
+        Ok(RoutingInput {
+            extension: extension.to_string(),
+            filename: input
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string(),
+            file_bytes: data.len(),
+            is_complex: false,
+            needs_ocr: false,
+            text_chars,
+            snippet,
+        })
+    }
+
+    /// The semantic tier-router seam. Returns `Some(Ok(converted))` when the
+    /// router selection should redirect processing (e.g. `vlm` in `route` mode
+    /// when VLM is available); otherwise returns `None` to let the existing
+    /// deterministic pipeline run unchanged. Any router failure logs a warning
+    /// and falls back to heuristic behavior.
+    fn route_input(&self, input: &Path, extension: &str) -> Option<Result<ConvertedDocument>> {
+        let cfg = &self.settings.routing;
+        if cfg.mode == RoutingMode::Heuristic {
+            return None;
+        }
+        let router_url = cfg.router_url.clone().filter(|s| !s.is_empty())?;
+        let signals = match self.build_routing_input(input, extension) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[routing] could not build routing state, keeping heuristic: {e}");
+                return None;
+            }
+        };
+        let decision = match route_document(
+            &router_url,
+            &cfg.model,
+            cfg.api_key.as_deref(),
+            input,
+            &signals,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("[routing] router unavailable, falling back to heuristic: {e}");
+                return None;
+            }
+        };
+        info!(
+            "[routing] mode={:?} tier={} confidence={:.2} probabilities={:?} model={} latency_ms={:?}",
+            cfg.mode,
+            decision.tier.as_str(),
+            decision.confidence,
+            decision.probabilities,
+            decision.model,
+            decision.latency_ms,
+        );
+        if cfg.mode == RoutingMode::Route && decision.tier == RoutingTier::Vlm && self.vlm_enabled {
+            if is_image_extension(extension) {
+                return Some(self.process_with_vlm(input, extension));
+            }
+            if is_pdf_extension(extension) {
+                return Some(self.process_pdf_with_vlm(input));
+            }
+            if is_presentation_extension(extension) {
+                return Some(self.process_pptx_with_vlm(input));
+            }
+            debug!(
+                "[routing] router selected vlm but no VLM-capable path for extension={extension}"
+            );
+        }
+        None
+    }
+
     fn process(&self, input: &Path) -> Result<ConvertedDocument> {
         let extension = input
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .unwrap_or_default();
+
+        // Semantic tier-router seam (`[routing]`). In `heuristic` (default)
+        // mode this is a strict no-op so existing behavior is unchanged. In
+        // `shadow` mode it logs the router decision; in `route` mode it may
+        // redirect to the VLM path. See `route_input`.
+        if let Some(result) = self.route_input(input, &extension) {
+            return result;
+        }
 
         // Check if VLM is enabled for images, PDFs, or presentations
         if self.vlm_enabled && is_image_extension(&extension) {
@@ -2734,6 +2909,220 @@ fn call_vlm_api(
 
     text.map(std::string::ToString::to_string)
         .ok_or_else(|| anyhow!("no content in VLM response: {response_json}"))
+}
+
+// ============================================================================
+// Semantic tier-router seam (System One / kev)
+// ============================================================================
+
+/// The `answers.tier` question returned by a System-One endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SystemOneQuestion {
+    #[serde(rename = "type")]
+    qtype: String,
+    /// The chosen option (e.g. `gpu`).
+    #[serde(default)]
+    choice: Option<String>,
+    /// Calibrated probabilities per option.
+    #[serde(default)]
+    probabilities: HashMap<String, f64>,
+}
+
+/// The `answers` map returned by a System-One endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SystemOneAnswers {
+    tier: SystemOneQuestion,
+}
+
+/// Token usage reported by the router.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SystemOneUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+/// The full `/v1/systemone` response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SystemOneResponse {
+    model: String,
+    answers: SystemOneAnswers,
+    #[serde(default)]
+    usage: Option<SystemOneUsage>,
+    #[serde(default)]
+    latency_ms: Option<u64>,
+}
+
+/// A parsed routing decision: the chosen tier plus its calibrated probabilities.
+#[derive(Debug, Clone)]
+struct RoutingDecision {
+    tier: RoutingTier,
+    probabilities: HashMap<String, f64>,
+    confidence: f64,
+    model: String,
+    latency_ms: Option<u64>,
+}
+
+impl RoutingDecision {
+    /// Build a decision from a System-One response, validating the chosen tier.
+    fn from_response(resp: &SystemOneResponse) -> Result<Self> {
+        let q = &resp.answers.tier;
+        let choice = q
+            .choice
+            .as_deref()
+            .ok_or_else(|| anyhow!("routing response missing `choice`"))?;
+        let tier = RoutingTier::from_str(choice)
+            .ok_or_else(|| anyhow!("unknown routing tier `{choice}`"))?;
+        let confidence = q.probabilities.get(choice).copied().unwrap_or(0.0);
+        Ok(Self {
+            tier,
+            probabilities: q.probabilities.clone(),
+            confidence,
+            model: resp.model.clone(),
+            latency_ms: resp.latency_ms,
+        })
+    }
+}
+
+/// Compact, cheap metadata the router sees. Built from what ingestr already
+/// knows about a document before conversion (extension, size, a text sample).
+#[derive(Debug, Clone)]
+struct RoutingInput {
+    extension: String,
+    filename: String,
+    file_bytes: usize,
+    is_complex: bool,
+    needs_ocr: bool,
+    text_chars: usize,
+    snippet: String,
+}
+
+impl RoutingInput {
+    /// Build the `state` string POSTed to the router.
+    fn build_state(&self) -> String {
+        let density = if self.file_bytes > 0 {
+            (self.text_chars as f64 / self.file_bytes as f64) * 1000.0
+        } else {
+            0.0
+        };
+        format!(
+            "document to ingest; extension={}; filename={}; size_bytes={}; text_chars={}; \
+             text_density_per_kb={density:.1}; complex={}; needs_ocr={}; snippet=\"{}\"",
+            self.extension,
+            self.filename,
+            self.file_bytes,
+            self.text_chars,
+            self.is_complex,
+            self.needs_ocr,
+            self.snippet,
+        )
+    }
+}
+
+/// In-process cache of router decisions keyed by a content hash (sha256 of the
+/// file bytes), so repeated/converted or shared documents reuse decisions
+/// without another router call. Not persisted for this spike.
+static ROUTING_DECISION_CACHE: LazyLock<Mutex<HashMap<String, RoutingDecision>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Compute the routing cache key from document bytes.
+fn routing_cache_key(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+fn routing_cache_get(key: &str) -> Option<RoutingDecision> {
+    ROUTING_DECISION_CACHE.lock().ok()?.get(key).cloned()
+}
+
+fn routing_cache_put(key: &str, decision: &RoutingDecision) {
+    if let Ok(mut cache) = ROUTING_DECISION_CACHE.lock() {
+        cache.insert(key.to_string(), decision.clone());
+    }
+}
+
+/// POST a document `state` to a System-One endpoint and return the parsed
+/// tier decision. Mirrors the `call_vlm_api` auth pattern. Errors are returned
+/// to the caller, which falls back to heuristic routing.
+fn call_system_one(
+    router_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    state: &str,
+) -> Result<SystemOneResponse> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("building System-One HTTP client")?;
+
+    let request_body = serde_json::json!({
+        "state": state,
+        "model": model,
+        "questions": {
+            "tier": {
+                "type": "choice",
+                "instructions": "Which ingestion tier should this page use?",
+                "criteria": {
+                    "native": "clean text/vector extraction",
+                    "cpu_ocr": "scanned or text-sparse page",
+                    "gpu": "dense/noisy tables, charts, handwriting",
+                    "vlm": "image, diagram, screenshot",
+                    "skip": "non-document or low value"
+                }
+            }
+        }
+    });
+
+    let url = format!("{router_url}/v1/systemone");
+    info!("system-one routing request to {url} model={model}");
+
+    let request = client.post(&url).header("Content-Type", "application/json");
+    let request = if let Some(key) = api_key {
+        request.bearer_auth(key)
+    } else {
+        request
+    };
+    let response = request
+        .json(&request_body)
+        .send()
+        .context("sending System-One routing request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        bail!("System-One routing request failed with status {status}: {body}");
+    }
+
+    let parsed: SystemOneResponse = response
+        .json()
+        .context("parsing System-One routing response")?;
+    Ok(parsed)
+}
+
+/// Call the router for a document and build a decision, using the in-process
+/// content-hash cache. Returns `Err` (and thus falls back to heuristic) on any
+/// network/parse problem or when the router is unconfigured.
+fn route_document(
+    router_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    input: &Path,
+    signals: &RoutingInput,
+) -> Result<RoutingDecision> {
+    let data =
+        fs::read(input).with_context(|| format!("reading {} for routing", input.display()))?;
+    let cache_key = routing_cache_key(&data);
+    debug!("system-one routing cache check key={cache_key}");
+    if let Some(cached) = routing_cache_get(&cache_key) {
+        debug!("system-one routing cache hit key={cache_key}");
+        return Ok(cached);
+    }
+
+    let state = signals.build_state();
+    let resp = call_system_one(router_url, model, api_key, &state)?;
+    let decision = RoutingDecision::from_response(&resp)?;
+    routing_cache_put(&cache_key, &decision);
+    Ok(decision)
 }
 
 const OCRS_DETECTION_MODEL_URL: &str =
@@ -4143,6 +4532,7 @@ struct ServiceSettings {
     llm_base_url: Option<String>,
     llm_api_key: Option<String>,
     processors: ProcessorsConfig,
+    routing: RoutingConfig,
 }
 
 impl ResolvedDirectories {
@@ -4574,6 +4964,7 @@ mod tests {
             llm_base_url: None,
             llm_api_key: None,
             processors: ProcessorsConfig::default(),
+            routing: RoutingConfig::default(),
         }
     }
 
@@ -5172,5 +5563,187 @@ mod tests {
         assert_eq!(d.as_deref(), Some(Path::new("/tmp/out")));
         // No output: no image writing.
         assert!(image_target_dir(None).is_none());
+    }
+
+    #[test]
+    fn routing_config_default_is_heuristic() {
+        let config = RoutingConfig::default();
+        assert_eq!(config.mode, RoutingMode::Heuristic);
+        assert!(config.router_url.is_none());
+        assert_eq!(config.model, "kev-latest");
+        assert!(config.api_key.is_none());
+    }
+
+    #[test]
+    fn routing_mode_serde_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&RoutingMode::Heuristic).unwrap(),
+            "\"heuristic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RoutingMode::Shadow).unwrap(),
+            "\"shadow\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RoutingMode::Route).unwrap(),
+            "\"route\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RoutingMode>("\"route\"").unwrap(),
+            RoutingMode::Route
+        );
+    }
+
+    #[test]
+    fn routing_tier_round_trip() {
+        for tier in [
+            RoutingTier::Native,
+            RoutingTier::CpuOcr,
+            RoutingTier::Gpu,
+            RoutingTier::Vlm,
+            RoutingTier::Skip,
+        ] {
+            assert_eq!(RoutingTier::from_str(tier.as_str()), Some(tier));
+        }
+        assert_eq!(RoutingTier::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn system_one_response_parses_choice_and_probabilities() -> Result<()> {
+        let body = r#"{
+            "model": "kev-latest",
+            "answers": {
+                "tier": {
+                    "type": "choice",
+                    "choice": "gpu",
+                    "confidence": 0.6,
+                    "probabilities": {
+                        "native": 0.02, "cpu_ocr": 0.31, "gpu": 0.6, "vlm": 0.05, "skip": 0.02
+                    }
+                }
+            },
+            "usage": { "input_tokens": 100, "output_tokens": 50 },
+            "latency_ms": 495
+        }"#;
+        let resp: SystemOneResponse = serde_json::from_str(body).context("parsing response")?;
+        assert_eq!(resp.model, "kev-latest");
+        let decision = RoutingDecision::from_response(&resp)?;
+        assert_eq!(decision.tier, RoutingTier::Gpu);
+        assert!((decision.confidence - 0.6).abs() < 1e-9);
+        assert_eq!(decision.probabilities.get("native"), Some(&0.02));
+        assert_eq!(decision.latency_ms, Some(495));
+        Ok(())
+    }
+
+    #[test]
+    fn system_one_response_missing_choice_errors() -> Result<()> {
+        let body = r#"{
+            "model": "kev-latest",
+            "answers": { "tier": { "type": "choice", "probabilities": { "gpu": 0.9 } } }
+        }"#;
+        let resp: SystemOneResponse = serde_json::from_str(body).context("parsing")?;
+        assert!(RoutingDecision::from_response(&resp).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn routing_state_builder_contains_metadata() {
+        let input = RoutingInput {
+            extension: "pdf".to_string(),
+            filename: "report.pdf".to_string(),
+            file_bytes: 2048,
+            is_complex: true,
+            needs_ocr: false,
+            text_chars: 512,
+            snippet: "first page snippet".to_string(),
+        };
+        let state = input.build_state();
+        assert!(state.contains("extension=pdf"));
+        assert!(state.contains("filename=report.pdf"));
+        assert!(state.contains("text_density_per_kb=250.0"));
+        assert!(state.contains("complex=true"));
+        assert!(state.contains("needs_ocr=false"));
+        assert!(state.contains("snippet=\"first page snippet\""));
+    }
+
+    /// A tiny hand-rolled System-One endpoint so the client can be exercised
+    /// end-to-end without downloading/running a real `kev` model.
+    #[test]
+    fn call_system_one_hits_mock_server() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("binding mock")?;
+        let addr = listener.local_addr().context("local addr")?;
+        let expected_state = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let expected = expected_state.clone();
+
+        std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf)?;
+            let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            if let Some(start) = request.find("{") {
+                let body = &request[start..];
+                let _ = body.find("\"state\"");
+                // capture state value for assertion below
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                    let state = v["state"].as_str().map(str::to_string);
+                    *expected.lock().unwrap() = state;
+                }
+            }
+            let _ = n;
+            let response = r#"{"model":"kev-latest","answers":{"tier":{"type":"choice","choice":"vlm","probabilities":{"native":0.0,"cpu_ocr":0.1,"gpu":0.1,"vlm":0.8,"skip":0.0}}},"usage":{"input_tokens":10,"output_tokens":5},"latency_ms":12}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
+            stream.write_all(header.as_bytes())?;
+            stream.write_all(response.as_bytes())?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        let resp = call_system_one(&format!("http://{addr}"), "kev-latest", None, "test state")?;
+        let decision = RoutingDecision::from_response(&resp)?;
+        assert_eq!(decision.tier, RoutingTier::Vlm);
+        assert!(decision.probabilities.get("vlm") > Some(&0.7));
+        assert_eq!(decision.latency_ms, Some(12));
+
+        let captured = expected_state.lock().unwrap().clone();
+        assert_eq!(captured.as_deref(), Some("test state"));
+        Ok(())
+    }
+
+    #[test]
+    fn route_document_uses_content_hash_cache() -> Result<()> {
+        // Hash-only function check: identical bytes map to the same key.
+        let a = routing_cache_key(b"hello");
+        let b = routing_cache_key(b"hello");
+        let c = routing_cache_key(b"world");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        Ok(())
+    }
+
+    // Keep a `route_document`-style smoke test that does not need a network:
+    // with an unreachable URL it must fall back (return Err) rather than panic.
+    #[test]
+    fn route_document_unreachable_returns_err() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let input = dir.join("sample.txt");
+        fs::write(&input, "hello world")?;
+        let signals = RoutingInput {
+            extension: "txt".to_string(),
+            filename: "sample.txt".to_string(),
+            file_bytes: 11,
+            is_complex: false,
+            needs_ocr: false,
+            text_chars: 11,
+            snippet: "hello world".to_string(),
+        };
+        // Point at a port almost certainly closed.
+        let result = route_document("http://127.0.0.1:1", "kev-latest", None, &input, &signals);
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

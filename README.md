@@ -212,7 +212,47 @@ enabled = true
 [paths]
 # data_dir = "$XDG_DATA_HOME/ingestr"
 # state_dir = "$XDG_STATE_HOME/ingestr"
+
+# Semantic tier-router seam (System One / kev). Optional SPIKE: routes each
+# document/page to one of a small closed set of ingestion tiers via a local
+# System-One decision model served over HTTP (`POST /v1/systemone`).
+# See docs/research/2026-ocr-vlm-semantic-router.md.
+[routing]
+mode = "heuristic"  # heuristic (default) | shadow | route
+# router_url = "http://localhost:8009"  # System-One base URL; required for shadow/route
+# model = "kev-latest"
+# api_key = "sk-..."
 ```
+
+### Semantic tier routing (SPIKE)
+
+Ingestr can optionally route each document to one of a fixed set of ingestion
+tiers (`native`/`cpu_ocr`/`gpu`/`vlm`/`skip`) using a local, trainable
+System-One decision model (e.g. `jaredpalmer/kev`) served over HTTP. This is a
+**spike / proof-of-concept seam**, not a production feature.
+
+Configure it under `[routing]`:
+
+```toml
+[routing]
+mode = "route"          # heuristic | shadow | route
+router_url = "http://localhost:8009"
+model = "kev-latest"
+# api_key = "sk-..."
+```
+
+| mode        | Behavior                                                              |
+|-------------|-----------------------------------------------------------------------|
+| `heuristic` | (default) No router call; existing deterministic behavior unchanged.  |
+| `shadow`    | Calls the router and logs the chosen tier + probabilities; does **not** change routing. |
+| `route`     | Calls the router; when it selects `vlm` and VLM is enabled, prefers the VLM path, otherwise logs and falls back to the deterministic pipeline. |
+
+In `shadow`/`route` mode, if the router is unreachable or returns an error, the
+pipeline falls back to the `heuristic` behavior and never panics. Router
+decisions are cached in-process by a content hash (sha256 of the file bytes) so
+repeated/converted documents reuse a decision. See
+`docs/research/2026-ocr-vlm-semantic-router.md` for the research and tier model
+recommendations.
 
 ### Environment Variables
 

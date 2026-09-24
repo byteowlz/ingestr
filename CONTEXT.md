@@ -161,3 +161,19 @@ _Avoid_: office docs (ambiguous)
 The `ingestr doctor` command reports which external tools are installed
 (LibreOffice, Poppler, Tesseract, ImageMagick, Python) and what each enables.
 _Avoid_: deps, requirements
+
+**Semantic Tier Router**:
+An optional SPIKE seam (`[routing]`) that routes each Document to one of a
+small closed set of ingestion **Tiers** (`native`, `cpu_ocr`, `gpu`, `vlm`,
+`skip`) using a local System-One decision model (e.g.
+`jaredpalmer/kev`) served over HTTP (`POST /v1/systemone`). It runs in
+`heuristic` (default, no router call), `shadow` (log only), or `route` (act on
+the tier selection) mode. Distinct from **Page-aware Routing** (LiteParse's
+within-PDF `is_complex` classification). _Avoid_: router (ambiguous with file
+type routing), semantic router
+
+**Tier**:
+One of the closed set of ingestion tiers a Document can be routed to by the
+**Semantic Tier Router**: `native` (clean text/vector), `cpu_ocr` (scanned or
+text-sparse), `gpu` (dense/noisy tables, charts, handwriting), `vlm` (image,
+diagram, screenshot), `skip` (non-document or low value). _Avoid_: level, rank
