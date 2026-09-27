@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Full-text index and search** (ADR-0003): ingestr converts documents; it does not index or search them. `tantivy`, `ingestr search`, `--index-dir`/`--disable-index`, the `[index]` config section and the MCP `search`/`open_source` tools are gone. Search over the Markdown output belongs to the consumer (oqto's own FTS, ripgrep, SQLite). **Breaking** for CLI and config.
+
+### Changed
+
+- **MCP server rewritten on the official Rust SDK** (`rmcp` 3.4, MCP protocol revision 2026-07-28, stdio). The previous server was a hand-rolled JSON-RPC loop that advertised no protocol version. Tools are now `convert_document` (inline Markdown with `ocr`/`raw`/`max_chars`/`pages`/`section`), `convert_to_file` (Markdown + extracted images on disk), `supported_formats` and `doctor`. It runs the `ingestr` CLI as a subprocess (`--ingestr-bin` / `INGESTR_BIN`, `--timeout`); no config file.
+- `ingestr-core` now holds the format-routing vocabulary (`formats::SUPPORTED_EXTENSIONS`, `is_liteparse_extension`, ...) shared by both binaries; the conversion pipeline follows (`ingestr-0frv`).
+
 ### Added
 
 - **Batch resume**: directory conversion now uses the content-hash conversion cache. Re-running an interrupted or repeated batch skips already-converted files (reported as `skipped`) and re-materialises missing output files from the cache instead of re-converting. Identical documents at different paths are converted once. Failures are not cached, so they are retried on the next run. The cache key covers the content hash plus every option that changes the result (engine, OCR backend and languages, VLM model, section/page selection) and a schema version, so a routing or engine change never serves stale output.

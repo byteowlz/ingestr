@@ -39,10 +39,6 @@ check-core:
 serve *args:
     cargo run -p ingestr-cli -- serve {{args}}
 
-# Search the index via CLI
-search query limit='10':
-    cargo run -p ingestr-cli -- search "{{query}}" --limit {{limit}}
-
 # Start the MCP server; pass additional flags after `--`
 mcp *args:
     cargo run -p ingestr-mcp -- {{args}}

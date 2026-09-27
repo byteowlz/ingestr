@@ -6,14 +6,11 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 
-description = "Core indexing types and full-text search over converted documents"
-keywords = ["document", "index", "search", "tantivy"]
+description = "Core document conversion library for ingestr (documents to Markdown)"
+keywords = ["document", "conversion", "markdown", "pdf"]
 categories = ["text-processing"]
 
 [dependencies]
-anyhow.workspace = true
-serde.workspace = true
-tantivy.workspace = true
 
 [lints]
 workspace = true

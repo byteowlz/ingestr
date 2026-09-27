@@ -6,28 +6,21 @@ license.workspace = true
 repository.workspace = true
 readme.workspace = true
 
-description = "Model Context Protocol server exposing ingestr full-text search"
-keywords = ["document", "search", "mcp", "llm"]
-categories = ["command-line-utilities", "text-processing"]
+description = "MCP server exposing ingestr document conversion to AI assistants"
+keywords = ["mcp", "document", "conversion", "markdown"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-config.workspace = true
-dirs.workspace = true
 env_logger.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-shellexpand.workspace = true
-tantivy.workspace = true
-time.workspace = true
-toml.workspace = true
+tokio.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 ingestr-core.workspace = true
-sysinfo.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true
