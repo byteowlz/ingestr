@@ -1,22 +1,25 @@
 # ingestr
 
-A background service that watches directories for documents, converts them to Markdown, and indexes them for full-text search. Includes an MCP server for integration with AI assistants.
+Converts documents to Markdown: PDFs, Office files, HTML, images and more, one
+file or a whole directory tree. Ships a CLI, an optional watch service that
+converts files as they appear, and an MCP server so AI assistants can convert
+documents on demand. ingestr does not index or search; search over its Markdown
+output belongs to whatever you already use for that (see ADR-0003).
 
 ## Features
 
-- **Document Conversion**: Automatically converts documents (PDF, DOCX, XLSX, PPTX, HTML, etc.) to Markdown. PDFs and presentations/documents (PPTX/DOCX) use [LiteParse](https://github.com/run-llama/liteparse) (fast native extraction + page-aware OCR merge + embedded-image extraction); spreadsheets and other formats use [markitdown](https://crates.io/crates/markitdown).
-- **OCR for scanned pages and images**: PP-OCR (PaddleOCR family) via a bundled ONNX runtime by default, CPU-only; models download on first use. Tesseract and other backends are available.
-- **Full-Text Search**: Indexes converted documents with [Tantivy](https://github.com/quickwit-oss/tantivy) for fast search
-- **Background Service**: Runs as a daemon watching for file changes
-- **MCP Server**: Exposes search functionality to AI assistants via the Model Context Protocol
-- **XDG Compliant**: Respects `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME`
+- **Document conversion**: PDF, DOCX, PPTX, XLSX, HTML, CSV, images and more to Markdown. PDFs and presentations/documents (PPTX/DOCX) use [LiteParse](https://github.com/run-llama/liteparse) (fast native extraction, page-aware OCR merge, embedded-image extraction); spreadsheets and other formats use [markitdown](https://crates.io/crates/markitdown).
+- **OCR for scanned pages and images**: PP-OCR (PaddleOCR family) via a bundled ONNX runtime by default, CPU-only; models download on first use. Tesseract and other backends are available. OCR only runs on pages that need it.
+- **Batch conversion that scales**: resumable by content hash, a document-format allowlist, per-file failure isolation, parallel workers, `--dry-run` and machine-readable `--json` output.
+- **Watch service**: converts documents as they land in a directory.
+- **MCP server**: exposes conversion to AI assistants over the Model Context Protocol (official `rmcp` SDK).
+- **XDG compliant**: respects `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME`.
 
 ## Installation
 
 ### From Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/byteowlz/ingestr.git
 cd ingestr
 
@@ -33,28 +36,23 @@ just install-all
 
 ## Quick Start
 
-1. **Initialize configuration:**
+Convert a single file to stdout:
+
+```bash
+ingestr convert report.pdf
+```
+
+Convert every document in the current directory (add `-r` for subdirectories):
+
+```bash
+ingestr convert . -r --output out/
+```
+
+Optionally create a config file and run the watch service:
 
 ```bash
 ingestr init
-```
-
-This creates a config file at `~/.config/ingestr/config.toml`.
-
-2. **Start the service:**
-
-```bash
-# Run in foreground
 ingestr service run
-
-# Or run as background daemon
-ingestr service start
-```
-
-3. **Search your documents:**
-
-```bash
-ingestr search "quarterly report"
 ```
 
 ## CLI Usage
@@ -63,9 +61,8 @@ ingestr search "quarterly report"
 ingestr <COMMAND>
 
 Commands:
-  service      Manage the background conversion and indexing service
-  search       Query the search index
   convert      Convert documents to Markdown (file, directory, or URL)
+  service      Manage the background conversion service
   init         Create config directories and default files
   config       Inspect and manage configuration
   cache        Inspect or clear the conversion cache
@@ -75,7 +72,7 @@ Commands:
 
 ### External dependencies
 
-PDF conversion, spreadsheets, OCR and search need **no external tools**: LiteParse
+PDF conversion, spreadsheets and OCR need **no external tools**: LiteParse
 bundles PDFium, and the default `paddle` OCR backend bundles an ONNX runtime
 (PP-OCR models are downloaded on first use into `~/.oar`). Converting PPTX/DOCX
 requires **LibreOffice** (`soffice`); some optional OCR backends use Poppler
@@ -107,7 +104,8 @@ Batch runs are resumable: converted files are cached by content hash, so
 re-running after an interruption only converts what is new or changed (and
 re-creates missing outputs from the cache). By default only known document
 formats are attempted; use `--extensions pdf,docx` to narrow, `--all-files` to
-try everything, and `--engine liteparse|markitdown` to force an engine.
+try everything, and `--engine liteparse|markitdown` to force an engine. Add
+`--ocr` for scanned documents; it only OCRs pages that actually need it.
 
 ### Service Commands
 
@@ -136,22 +134,7 @@ ingestr service run --once
 ```bash
 --watch-dir <PATH>    Directory to watch for documents (default: ~/Documents)
 --output-dir <PATH>   Directory for converted Markdown files (default: ~/markdown)
---index-dir <PATH>    Directory for search index (default: $XDG_DATA_HOME/ingestr-cli/index)
---disable-index       Convert files without indexing
 --once                Process existing files and exit
-```
-
-### Search
-
-```bash
-# Basic search
-ingestr search "search terms"
-
-# Limit results
-ingestr search "budget" --limit 5
-
-# Output as JSON
-ingestr search "report" --json
 ```
 
 ### Configuration
@@ -213,13 +196,15 @@ skip_hidden = true
 [output]
 markdown_dir = "~/markdown"
 
-[index]
-enabled = true
-# index_dir = "$XDG_DATA_HOME/ingestr/index"
-
 [paths]
 # data_dir = "$XDG_DATA_HOME/ingestr"
 # state_dir = "$XDG_STATE_HOME/ingestr"
+
+[processors.ocr]
+enabled = false
+backend = "paddle"        # paddle (default) | tesseract | ocrs | surya | easyocr
+paddle_model = "small"    # tiny | small | medium
+languages = ["eng"]
 
 # Semantic tier-router seam (System One / kev). Optional SPIKE: routes each
 # document/page to one of a small closed set of ingestion tiers via a local
@@ -231,6 +216,8 @@ mode = "heuristic"  # heuristic (default) | shadow | route
 # model = "kev-latest"
 # api_key = "sk-..."
 ```
+
+See `ingestr-cli/examples/config.toml` for every option with comments.
 
 ### Semantic tier routing (SPIKE)
 
@@ -268,12 +255,14 @@ Override any config value using environment variables:
 
 ```bash
 INGESTR_CLI__WATCHER__WATCH_DIR=~/MyDocs ingestr service run
-INGESTR_CLI__INDEX__ENABLED=false ingestr service run
+INGESTR_CLI__PROCESSORS__OCR__ENABLED=true ingestr service run
 ```
 
 ## MCP Server
 
-The `ingestr-mcp` binary provides an MCP server for AI assistant integration.
+The `ingestr-mcp` binary is an MCP server (official Rust SDK `rmcp`, protocol
+revision 2026-07-28, stdio transport) that lets AI assistants convert documents
+on demand. It runs the `ingestr` CLI as a subprocess, so install both binaries.
 
 ### Setup
 
@@ -281,9 +270,11 @@ Add to your MCP client configuration (e.g., Claude):
 
 ```json
 {
-  "ingestr": {
-    "command": "ingestr-mcp",
-    "args": []
+  "mcpServers": {
+    "ingestr": {
+      "command": "ingestr-mcp",
+      "args": []
+    }
   }
 }
 ```
@@ -298,26 +289,27 @@ ingestr-mcp --show-config
 
 | Tool | Description |
 |------|-------------|
-| `search` | Search the document index for relevant content |
-| `open_source` | Open a source document (requires confirmation) |
+| `convert_document` | Convert a file or http(s) URL to Markdown and return it; options `ocr`, `raw`, `max_chars`, `pages`, `section` |
+| `convert_to_file` | Convert and write Markdown (plus extracted images) to an output path |
+| `supported_formats` | List the file extensions ingestr can convert |
+| `doctor` | Report which optional external tools are installed |
 
 ### MCP Server Options
 
 ```bash
---config <PATH>      Override config file path
---index-dir <PATH>   Override index directory
---log-level <LEVEL>  Set log level (error, warn, info, debug, trace)
---show-config        Print MCP client configuration JSON and exit
+--ingestr-bin <PATH>   Path to the ingestr CLI (default: $INGESTR_BIN, a sibling binary, then PATH)
+--timeout <SECONDS>    Maximum seconds per conversion (default: 600)
+--log-level <LEVEL>    Set log level (error, warn, info, debug, trace); logs go to stderr
+--show-config          Print MCP client configuration JSON and exit
 ```
-
-The MCP server automatically starts the ingestr service if not already running.
 
 ## Directory Structure
 
 | Path | Description |
 |------|-------------|
 | `$XDG_CONFIG_HOME/ingestr/config.toml` | Configuration file |
-| `$XDG_DATA_HOME/ingestr/index/` | Tantivy search index |
+| `$XDG_CACHE_HOME/ingestr/` | Conversion cache (content-hash keyed) |
+| `~/.oar/` | PP-OCR models (downloaded on first OCR use) |
 | `$XDG_STATE_HOME/ingestr/service.pid` | Background service PID |
 | `$XDG_STATE_HOME/ingestr/service.log` | Background service logs |
 
@@ -325,22 +317,20 @@ The MCP server automatically starts the ingestr service if not already running.
 
 ```
 ingestr/
-  ingestr-cli/     # CLI application and background service
-  ingestr-core/    # Shared search index library
+  ingestr-cli/     # CLI application and watch service
+  ingestr-core/    # Shared conversion library (format routing today; pipeline next)
   ingestr-mcp/     # MCP server for AI assistants
+  vendor/          # Patched third-party crates (see vendor/*/PATCH.md)
 ```
 
 ## Development
 
 ```bash
-# Check all crates
-just check
+# Full gate: fmt, clippy, drift check, tests
+just check-all
 
 # Format code
 just fmt
-
-# Run tests
-just test
 
 # Run the service during development
 just serve

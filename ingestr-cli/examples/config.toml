@@ -21,10 +21,6 @@ skip_hidden = true
 [output]
 markdown_dir = "~/markdown"
 
-[index]
-enabled = true
-# index_dir = "$XDG_DATA_HOME/ingestr-cli/index"
-
 [paths]
 # data_dir = "$XDG_DATA_HOME/ingestr-cli"
 # state_dir = "$XDG_STATE_HOME/ingestr-cli"

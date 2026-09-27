@@ -12,8 +12,8 @@ If they disagree with anything here, the command is right.
 
 ## Domain & architecture
 
-- Read `CONTEXT.md` before domain work (ingestr = watch/convert/index documents
-  to Markdown for full-text search). Add ADRs in `docs/adr/` only for
+- Read `CONTEXT.md` before domain work (ingestr = convert documents to
+  Markdown; it does not index or search them, ADR-0003). Add ADRs in `docs/adr/` only for
   hard-to-reverse trade-offs.
 - Layout: `ingestr-core` is the library dependency root; `ingestr-cli`/
   `ingestr-mcp` depend on it but never on each other.

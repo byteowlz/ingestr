@@ -29,7 +29,6 @@ rayon.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tantivy.workspace = true
 shellexpand.workspace = true
 toml.workspace = true
 walkdir.workspace = true

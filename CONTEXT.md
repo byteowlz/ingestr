@@ -25,8 +25,8 @@ _Avoid_: processing, extract
 
 **Ingest**:
 The end-to-end flow of noticing a Document (via the watcher or an explicit
-convert command), converting it, writing the Markdown, and indexing it for
-search.
+convert command), converting it, and writing the Markdown plus extracted
+assets. Search over the output is the consumer's job (ADR-0003).
 _Avoid_: import (ambiguous with other tools)
 
 **Watch Directory**:
@@ -37,12 +37,6 @@ _Avoid_: input dir, source dir
 **Output / Markdown Directory**:
 Where Converted Documents are written as `.md` files.
 _Avoid_: out dir
-
-**Index**:
-The tantivy-backed full-text index over converted Documents, queried by the
-search command and the MCP server. One index may be writable (service) or
-read-only (search).
-_Avoid_: database, index dir (that is the on-disk location)
 
 **Processor Pipeline**:
 An ordered list of processors (`markitdown`, `ocr_fallback`, `vlm_images`, …)
@@ -73,18 +67,15 @@ _Avoid_: daemon-only, watch loop
 
 **Service Settings**:
 The resolved runtime configuration for one service run, built from config +
-CLI overrides (watch/output/index dirs, watcher, index, LLM, processors). Same
+CLI overrides (watch/output dirs, watcher, LLM, processors). Same
 type used by both one-shot convert and the long-running service.
 _Avoid_: config (the persisted AppConfig), runtime config
 
-**Search**:
-The full-text query over the Index, exposed by the `search` command and the
-MCP server. Returns scored hits with source/output paths.
-_Avoid_: query (the specific search string)
-
 **MCP Server**:
-The `ingestr-mcp` binary exposing search (and related) capabilities to AI
-assistants over the Model Context Protocol.
+The `ingestr-mcp` binary exposing conversion (`convert_document`,
+`convert_to_file`, `supported_formats`, `doctor`) to AI assistants over the
+Model Context Protocol, built on the official `rmcp` SDK and served over stdio.
+It runs the `ingestr` CLI as a subprocess. It does not search.
 _Avoid_: mcp (acronym used in names), api
 
 **VLM (Vision Language Model)**:

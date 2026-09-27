@@ -1,5 +1,5 @@
-//! `ingestr` CLI: watch directories, convert documents to Markdown, and
-//! index them for full-text search.
+//! `ingestr` CLI: convert documents to Markdown (one file, a directory
+//! tree, a URL, or a watched folder). It does not index or search (ADR-0003).
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -22,7 +22,10 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use config::{Config, Environment, File, FileFormat};
 use env_logger::fmt::WriteStyle;
-use ingestr_core::{IndexedDocument, SearchIndex};
+use ingestr_core::formats::{
+    SUPPORTED_EXTENSIONS, extension_of, is_hidden_component, is_liteparse_extension,
+    is_office_extension,
+};
 use liteparse::ocr::oar::OarOcrEngine;
 // Aliased: ingestr also imports `ocrs::OcrEngine` for the legacy image path.
 use liteparse::ocr::{OcrEngine as LiteOcrEngine, OcrOptions, OcrResult};
@@ -95,24 +98,9 @@ fn main() {
     }
 }
 
-/// File extensions ingestr knows how to convert. Used as the default filter in
-/// directory (batch) mode so a mixed pile does not waste time on binaries,
-/// archives or other non-documents. Override with `--extensions` or
-/// `--all-files`.
-const SUPPORTED_EXTENSIONS: &[&str] = &[
-    // Documents (LiteParse: PDFium / LibreOffice)
-    "pdf", "pptx", "ppt", "odp", "key", "docx", "doc", "odt", "xlsx", "xls", "ods",
-    // Web / feeds / data (markitdown)
-    "html", "htm", "xhtml", "rss", "atom", "xml", "csv", "tsv", "json", "ipynb",
-    // Plain text
-    "txt", "md", "markdown", "rst", "log", // Images (OCR / VLM paths)
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
-];
-
 /// Known subcommand names (used for default-subcommand detection).
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "service",
-    "search",
     "convert",
     "init",
     "config",
@@ -150,7 +138,6 @@ fn try_main() -> Result<()> {
 
     match cli.command {
         Command::Service { command } => handle_service(&ctx, command),
-        Command::Search(cmd) => handle_search(&ctx, cmd),
         Command::Convert(cmd) => handle_convert(&ctx, cmd),
         Command::Init(cmd) => handle_init(&ctx, cmd),
         Command::Config { command } => handle_config(&ctx, command),
@@ -164,7 +151,7 @@ fn try_main() -> Result<()> {
 #[command(
     author,
     version,
-    about = "Background service that converts documents to Markdown and indexes them for search.",
+    about = "Convert documents to Markdown: one file, a directory tree, a URL, or a watched folder.",
     propagate_version = true
 )]
 struct Cli {
@@ -228,14 +215,16 @@ enum ColorOption {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap subcommand payloads: Convert carries every conversion flag and is built once per process; clap's derive cannot box a variant"
+)]
 enum Command {
-    /// Manage the background conversion and indexing service
+    /// Manage the background conversion service (watch a directory)
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// Query the search index
-    Search(SearchCommand),
     /// Convert documents to Markdown (single file, directory, or URL)
     #[command(
         after_help = "Examples:\n\n  Convert one file to stdout:\n    ingestr convert report.pdf\n\n  Convert every document in the current directory to .md:\n    ingestr convert .\n\n  Convert every document in a directory tree (incl. subdirs) to .md:\n    ingestr convert . --recursive\n\n  Preview what would be converted (writes nothing):\n    ingestr convert . --dry-run\n\n  Machine-readable JSON summary of a batch conversion:\n    ingestr convert docs/ --recursive --json\n\n  Convert only PDFs and DOCX files, writing to out/:\n    ingestr convert . --recursive --extensions pdf,docx --output out/\n\n  Convert all .pptx files in the current directory:\n    ingestr convert . --batch pptx\n"
@@ -278,12 +267,6 @@ struct ServiceRunOpts {
     /// Directory to write converted markdown files
     #[arg(long, value_name = "PATH")]
     output_dir: Option<PathBuf>,
-    /// Directory to store the search index
-    #[arg(long, value_name = "PATH")]
-    index_dir: Option<PathBuf>,
-    /// Disable indexing while still converting files
-    #[arg(long)]
-    disable_index: bool,
     /// Convert the current contents and exit instead of watching for changes
     #[arg(long)]
     once: bool,
@@ -301,18 +284,6 @@ enum ServiceCommand {
     Restart(ServiceRunOpts),
     /// Show service status
     Status,
-}
-
-#[derive(Debug, Clone, Args)]
-struct SearchCommand {
-    /// Search query
-    query: String,
-    /// Maximum results to return
-    #[arg(long, default_value_t = 10)]
-    limit: usize,
-    /// Override the index directory
-    #[arg(long, value_name = "PATH")]
-    index_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -507,7 +478,6 @@ struct RuntimeContext {
 struct ResolvedDirectories {
     watch_dir: PathBuf,
     output_dir: PathBuf,
-    index_dir: PathBuf,
 }
 
 impl RuntimeContext {
@@ -515,7 +485,7 @@ impl RuntimeContext {
         let paths = AppPaths::discover(common.config.clone())?;
         let config = load_or_init_config(&paths, &common)?;
         let paths = paths.apply_overrides(&config)?;
-        let directories = ResolvedDirectories::from_config(&config, &paths)?;
+        let directories = ResolvedDirectories::from_config(&config)?;
         let ctx = Self {
             common,
             paths,
@@ -586,11 +556,10 @@ impl RuntimeContext {
     fn ensure_directories(&self) -> Result<()> {
         if self.common.dry_run {
             info!(
-                "dry-run: would ensure data dir {}, state dir {}, output dir {}, and index dir {}",
+                "dry-run: would ensure data dir {}, state dir {}, and output dir {}",
                 self.paths.data_dir.display(),
                 self.paths.state_dir.display(),
-                self.directories.output_dir.display(),
-                self.directories.index_dir.display()
+                self.directories.output_dir.display()
             );
             return Ok(());
         }
@@ -631,23 +600,9 @@ impl RuntimeContext {
             self.directories.output_dir.clone()
         };
 
-        let index_dir = if let Some(ref provided) = serve.index_dir {
-            expand_path(provided.clone())?
-        } else {
-            self.directories.index_dir.clone()
-        };
-
-        let index_enabled = if serve.disable_index {
-            false
-        } else {
-            self.config.index.enabled
-        };
-
         Ok(ServiceSettings {
             watch_dir,
             output_dir,
-            index_dir,
-            index_enabled,
             debounce: Duration::from_millis(self.config.watcher.debounce_ms.max(50)),
             skip_hidden: self.config.watcher.skip_hidden,
             data_dir: self.paths.data_dir.clone(),
@@ -724,7 +679,6 @@ struct AppConfig {
     paths: PathsConfig,
     watcher: WatcherConfig,
     output: OutputConfig,
-    index: IndexConfig,
     llm: LlmConfig,
     processors: ProcessorsConfig,
     routing: RoutingConfig,
@@ -748,7 +702,6 @@ impl Default for AppConfig {
             paths: PathsConfig::default(),
             watcher: WatcherConfig::default(),
             output: OutputConfig::default(),
-            index: IndexConfig::default(),
             llm: LlmConfig::default(),
             processors: ProcessorsConfig::default(),
             routing: RoutingConfig::default(),
@@ -825,22 +778,6 @@ impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             markdown_dir: default_output_dir_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct IndexConfig {
-    enabled: bool,
-    index_dir: Option<String>,
-}
-
-impl Default for IndexConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            index_dir: None,
         }
     }
 }
@@ -1088,16 +1025,9 @@ fn run_service_foreground(ctx: &RuntimeContext, cmd: ServiceRunOpts) -> Result<(
         settings.output_dir.display()
     );
 
-    if settings.index_enabled {
-        info!("indexing enabled at {}", settings.index_dir.display());
-    } else {
-        warn!("indexing disabled; searches will not include new documents");
-    }
-
     let mut service = ConversionService::new(settings)?;
     if cmd.once {
         service.process_existing()?;
-        service.flush_index()?;
         return Ok(());
     }
 
@@ -1204,12 +1134,6 @@ fn append_service_args(cmd: &mut ProcCommand, opts: &ServiceRunOpts) {
     if let Some(ref dir) = opts.output_dir {
         cmd.arg("--output-dir").arg(dir);
     }
-    if let Some(ref dir) = opts.index_dir {
-        cmd.arg("--index-dir").arg(dir);
-    }
-    if opts.disable_index {
-        cmd.arg("--disable-index");
-    }
     if opts.once {
         cmd.arg("--once");
     }
@@ -1235,38 +1159,6 @@ fn process_running(pid: i32) -> bool {
     let mut sys = System::new();
     sys.refresh_process(Pid::from_u32(pid as u32));
     sys.process(Pid::from_u32(pid as u32)).is_some()
-}
-
-fn handle_search(ctx: &RuntimeContext, cmd: SearchCommand) -> Result<()> {
-    let index_dir = if let Some(ref provided) = cmd.index_dir {
-        expand_path(provided.clone())?
-    } else {
-        ctx.directories.index_dir.clone()
-    };
-
-    let mut index = SearchIndex::open(&index_dir, false)?;
-
-    let results = index.search(&cmd.query, cmd.limit)?;
-
-    if ctx.common.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&results).context("serializing search results to JSON")?
-        );
-    } else if results.is_empty() {
-        println!("No results found");
-    } else {
-        for hit in &results {
-            println!(
-                "- {} (score {:.2}) -> {}",
-                hit.title.as_deref().unwrap_or(hit.source_path.as_str()),
-                hit.score,
-                hit.output_path
-            );
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1317,41 +1209,6 @@ where
             None
         }
     }
-}
-
-#[cfg(test)]
-fn convert_single_file(
-    markitdown: &MarkItDown,
-    input: &Path,
-    conversion_opts: Option<ConversionOptions>,
-) -> Result<ConvertedDocument> {
-    let path_str = input
-        .to_str()
-        .ok_or_else(|| anyhow!("invalid path encoding for {}", input.display()))?;
-
-    let context = format!("converting {}", input.display());
-    if let Some(converted) =
-        safe_markitdown_convert(&context, || markitdown.convert(path_str, conversion_opts))
-    {
-        return Ok(ConvertedDocument {
-            title: converted.title,
-            text_content: converted.text_content,
-            already_written: false,
-        });
-    }
-
-    let text = fs::read_to_string(input).with_context(|| {
-        format!(
-            "no converter available for {}, and file could not be read as UTF-8 text",
-            input.display()
-        )
-    })?;
-
-    Ok(ConvertedDocument {
-        title: None,
-        text_content: text,
-        already_written: false,
-    })
 }
 
 fn render_frontmatter_markdown(frontmatter: &Frontmatter, text_content: &str) -> Result<String> {
@@ -2870,38 +2727,9 @@ fn is_presentation_extension(ext: &str) -> bool {
     matches!(ext, "pptx" | "ppt" | "odp" | "key")
 }
 
-/// Whether LiteParse handles this format directly (PDF via PDFium, office
-/// formats via LibreOffice conversion). Plain images stay on the markitdown /
-/// OCR path.
-/// Spreadsheets (`xlsx`/`xls`) are deliberately excluded: markitdown renders
-/// them as proper Markdown tables (header row, every sheet), where LiteParse's
-/// LibreOffice-to-PDF path loses the header row and flattens small sheets.
-fn is_liteparse_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "pdf" | "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "ods"
-    )
-}
-
-/// Whether a format needs LibreOffice for conversion (office documents).
-fn is_office_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "pptx" | "ppt" | "odp" | "key" | "docx" | "doc" | "odt" | "ods"
-    )
-}
-
 /// Whether LibreOffice (`soffice`/`libreoffice`) is available on PATH.
 fn has_libreoffice() -> bool {
     command_exists("soffice") || command_exists("libreoffice")
-}
-
-/// The lowercased file extension of a path, or an empty string.
-fn extension_of(path: &Path) -> String {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default()
 }
 
 /// Check if a PDF file is encrypted/password-protected.
@@ -3611,13 +3439,6 @@ fn liteparse_runtime() -> Result<&'static Runtime> {
         .map_err(|e| anyhow!("failed to create liteparse tokio runtime: {e}"))
 }
 
-/// Whether a path component denotes a hidden file/dir. The special "." and
-/// ".." components are not hidden (they are the current/parent directory), so
-/// a relative input like "." still matches its own contents.
-fn is_hidden_component(component: Option<&str>) -> bool {
-    component.is_some_and(|s| s.starts_with('.') && s != "." && s != "..")
-}
-
 /// Map an ingestr OCR language to a Tesseract/liteparse language code.
 fn map_ocr_lang(lang: &str) -> String {
     match lang.to_ascii_lowercase().as_str() {
@@ -3781,14 +3602,11 @@ fn pdf_needs_ocr(path: &Path, ocr_sparse_pages: bool) -> bool {
 }
 
 fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
-    let mut settings = ctx.service_settings(&ServiceRunOpts {
+    let settings = ctx.service_settings(&ServiceRunOpts {
         watch_dir: None,
         output_dir: None,
-        index_dir: None,
-        disable_index: true,
         once: true,
     })?;
-    settings.index_enabled = false;
 
     // Clipboard input
     if cmd.clipboard {
@@ -4669,8 +4487,7 @@ fn load_or_init_config(paths: &AppPaths, common: &CommonOpts) -> Result<AppConfi
         .set_default("watcher.watch_dir", default_watch_dir_string())?
         .set_default("watcher.debounce_ms", 750_i64)?
         .set_default("watcher.skip_hidden", true)?
-        .set_default("output.markdown_dir", default_output_dir_string())?
-        .set_default("index.enabled", true)?;
+        .set_default("output.markdown_dir", default_output_dir_string())?;
 
     if let Some(ref dir) = paths.global_config.parent() {
         fs::create_dir_all(dir)
@@ -4839,8 +4656,6 @@ fn default_parallelism() -> usize {
 struct ServiceSettings {
     watch_dir: PathBuf,
     output_dir: PathBuf,
-    index_dir: PathBuf,
-    index_enabled: bool,
     debounce: Duration,
     skip_hidden: bool,
     data_dir: PathBuf,
@@ -4855,19 +4670,12 @@ struct ServiceSettings {
 }
 
 impl ResolvedDirectories {
-    fn from_config(cfg: &AppConfig, paths: &AppPaths) -> Result<Self> {
+    fn from_config(cfg: &AppConfig) -> Result<Self> {
         let watch_dir = expand_str_path(&cfg.watcher.watch_dir)?;
         let output_dir = expand_str_path(&cfg.output.markdown_dir)?;
-        let index_dir = if let Some(ref explicit) = cfg.index.index_dir {
-            expand_str_path(explicit)?
-        } else {
-            paths.data_dir.join("index")
-        };
-
         Ok(Self {
             watch_dir,
             output_dir,
-            index_dir,
         })
     }
 }
@@ -4875,27 +4683,18 @@ impl ResolvedDirectories {
 struct ConversionService {
     settings: ServiceSettings,
     markitdown: MarkItDown,
-    indexer: Option<SearchIndex>,
 }
 
 impl ConversionService {
     fn new(settings: ServiceSettings) -> Result<Self> {
-        let indexer = if settings.index_enabled {
-            Some(SearchIndex::open(&settings.index_dir, true)?)
-        } else {
-            None
-        };
-
         Ok(Self {
             settings,
             markitdown: MarkItDown::new(),
-            indexer,
         })
     }
 
     fn run(&mut self) -> Result<()> {
         self.process_existing()?;
-        self.flush_index()?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown.clone();
@@ -4916,7 +4715,6 @@ impl ConversionService {
             match rx.recv_timeout(self.settings.debounce) {
                 Ok(Ok(event)) => {
                     self.handle_event(event)?;
-                    self.flush_index()?;
                 }
                 Ok(Err(err)) => warn!("watch error: {err}"),
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -4924,7 +4722,7 @@ impl ConversionService {
             }
         }
 
-        self.flush_index()
+        Ok(())
     }
 
     fn build_watcher(
@@ -4952,11 +4750,6 @@ impl ConversionService {
             self.process_path(path)?;
         }
 
-        // Also index any existing markdown outputs (so prior conversions are searchable
-        // even if the source files haven't changed).
-        if self.settings.index_enabled {
-            self.index_existing_outputs()?;
-        }
         Ok(())
     }
 
@@ -5006,17 +4799,11 @@ impl ConversionService {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
 
         if is_markdown && output_path == path {
-            if let Some(indexer) = self.indexer.as_mut() {
-                Self::index_existing_output(indexer, &output_path, path)?;
-            }
             return Ok(());
         }
 
         if !self.needs_processing(path, &output_path)? {
             debug!("skipping {} (already up to date)", path.display());
-            if let Some(indexer) = self.indexer.as_mut() {
-                Self::index_existing_output(indexer, &output_path, path)?;
-            }
             return Ok(());
         }
 
@@ -5096,16 +4883,6 @@ impl ConversionService {
             .with_context(|| format!("writing markdown to {}", output_path.display()))?;
         info!("converted {} -> {}", path.display(), output_path.display());
 
-        if let Some(indexer) = self.indexer.as_mut() {
-            indexer.index_document(&IndexedDocument {
-                source_path: path.display().to_string(),
-                output_path: output_path.display().to_string(),
-                title: converted.title.clone(),
-                content: converted.text_content.clone(),
-                converted_at: Some(converted_at),
-            })?;
-        }
-
         Ok(())
     }
 
@@ -5133,72 +4910,6 @@ impl ConversionService {
         output.set_extension("md");
         Ok(output)
     }
-
-    fn flush_index(&mut self) -> Result<()> {
-        if let Some(indexer) = self.indexer.as_mut() {
-            indexer.commit()?;
-        }
-        Ok(())
-    }
-
-    fn index_existing_output(
-        indexer: &mut SearchIndex,
-        output_path: &Path,
-        source_path: &Path,
-    ) -> Result<()> {
-        let body = match fs::read_to_string(output_path) {
-            Ok(b) => b,
-            Err(err) => {
-                warn!(
-                    "unable to read {} for indexing: {err}",
-                    output_path.display()
-                );
-                return Ok(());
-            }
-        };
-
-        let (frontmatter, content) = parse_frontmatter(&body);
-        let source_path_str = frontmatter.as_ref().map_or_else(
-            || source_path.display().to_string(),
-            |fm| fm.source_path.clone(),
-        );
-
-        let indexed = IndexedDocument {
-            source_path: source_path_str,
-            output_path: output_path.display().to_string(),
-            title: frontmatter.as_ref().and_then(|fm| fm.title.clone()),
-            content: content.to_string(),
-            converted_at: frontmatter.as_ref().map(|fm| fm.converted_at.clone()),
-        };
-
-        indexer.index_document(&indexed)
-    }
-
-    fn index_existing_outputs(&mut self) -> Result<()> {
-        let Some(indexer) = self.indexer.as_mut() else {
-            return Ok(());
-        };
-
-        for entry in WalkDir::new(&self.settings.output_dir)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let is_markdown = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-            if !is_markdown {
-                continue;
-            }
-            let source_path = path; // will be overwritten by frontmatter if present
-            let _ = Self::index_existing_output(indexer, path, source_path);
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5213,19 +4924,6 @@ struct Frontmatter {
 fn system_time_to_rfc3339(time: SystemTime) -> Option<String> {
     let datetime: OffsetDateTime = time.into();
     datetime.format(&Rfc3339).ok()
-}
-
-fn parse_frontmatter(body: &str) -> (Option<Frontmatter>, &str) {
-    if let Some(rest) = body.strip_prefix("---\n")
-        && let Some(idx) = rest.find("\n---\n")
-    {
-        let (front, content) = rest.split_at(idx);
-        let content = &content["\n---\n".len()..];
-        if let Ok(parsed) = serde_json::from_str::<Frontmatter>(front) {
-            return (Some(parsed), content);
-        }
-    }
-    (None, body)
 }
 
 fn default_watch_dir_string() -> String {
@@ -5271,8 +4969,6 @@ mod tests {
         ServiceSettings {
             watch_dir: PathBuf::from("/tmp"),
             output_dir: PathBuf::from("/tmp/output"),
-            index_dir: PathBuf::from("/tmp/index"),
-            index_enabled: false,
             debounce: Duration::from_millis(50),
             skip_hidden: true,
             data_dir: PathBuf::from("/tmp/data"),
@@ -5285,36 +4981,6 @@ mod tests {
             processors: ProcessorsConfig::default(),
             routing: RoutingConfig::default(),
         }
-    }
-
-    #[test]
-    fn convert_single_file_renders_frontmatter_and_content() -> Result<()> {
-        let dir = unique_temp_dir();
-        fs::create_dir_all(&dir)?;
-        let input = dir.join("sample.txt");
-        fs::write(&input, "Hello world")?;
-
-        let markitdown = MarkItDown::new();
-        let converted = convert_single_file(&markitdown, &input, None)?;
-
-        let frontmatter = Frontmatter {
-            source_path: input.display().to_string(),
-            output_path: "-".to_string(),
-            source_modified: None,
-            title: converted.title.clone(),
-            converted_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-
-        let markdown = render_frontmatter_markdown(&frontmatter, &converted.text_content)?;
-        let (parsed, body) = parse_frontmatter(&markdown);
-
-        let parsed = parsed.expect("frontmatter parsed");
-        assert_eq!(parsed.source_path, input.display().to_string());
-        assert_eq!(parsed.output_path, "-");
-        assert!(body.contains("Hello world"));
-
-        let _ = fs::remove_dir_all(&dir);
-        Ok(())
     }
 
     #[test]
@@ -5588,45 +5254,6 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_serialization_roundtrip() -> Result<()> {
-        let frontmatter = Frontmatter {
-            source_path: "/test/input.txt".to_string(),
-            output_path: "/test/output.md".to_string(),
-            source_modified: Some("2025-01-01T00:00:00Z".to_string()),
-            title: Some("Test Title".to_string()),
-            converted_at: "2025-01-01T00:00:01Z".to_string(),
-        };
-
-        let content = "Test content here.";
-        let markdown = render_frontmatter_markdown(&frontmatter, content)?;
-        let (parsed, body) = parse_frontmatter(&markdown);
-
-        let parsed = parsed.expect("frontmatter should parse");
-        assert_eq!(parsed.source_path, frontmatter.source_path);
-        assert_eq!(parsed.output_path, frontmatter.output_path);
-        assert_eq!(parsed.title, frontmatter.title);
-        assert!(body.contains(content));
-
-        Ok(())
-    }
-
-    #[test]
-    fn parse_frontmatter_handles_missing() {
-        let content = "No frontmatter here";
-        let (fm, body) = parse_frontmatter(content);
-        assert!(fm.is_none());
-        assert_eq!(body, content);
-    }
-
-    #[test]
-    fn parse_frontmatter_handles_malformed() {
-        let content = "---\ninvalid json here\n---\nBody content";
-        let (fm, _body) = parse_frontmatter(content);
-        // Should return None for malformed frontmatter
-        assert!(fm.is_none());
-    }
-
-    #[test]
     fn convert_result_json_serialization() -> Result<()> {
         let result = ConvertResult {
             source_path: "/test.txt".to_string(),
@@ -5827,52 +5454,29 @@ mod tests {
     }
 
     #[test]
+    fn render_frontmatter_is_json_in_yaml_fence() {
+        let fm = Frontmatter {
+            source_path: "/in/a.pdf".to_string(),
+            output_path: "/out/a.md".to_string(),
+            source_modified: None,
+            title: Some("A".to_string()),
+            converted_at: "2026-09-27T00:00:00Z".to_string(),
+        };
+        let out = render_frontmatter_markdown(&fm, "# A\n").unwrap();
+        assert!(out.starts_with("---\n{"), "{out}");
+        assert!(out.contains("\"source_path\":\"/in/a.pdf\""));
+        assert!(out.trim_end().ends_with("# A"));
+        let json_line = out.lines().nth(1).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(json_line).is_ok());
+    }
+
+    #[test]
     fn map_ocr_lang_normalizes_long_names() {
         assert_eq!(map_ocr_lang("english"), "eng");
         assert_eq!(map_ocr_lang("german"), "deu");
         assert_eq!(map_ocr_lang("ENG"), "eng");
         assert_eq!(map_ocr_lang("deu"), "deu");
         assert_eq!(map_ocr_lang("fra"), "fra");
-    }
-
-    #[test]
-    fn hidden_component_ignores_dot_and_dotdot() {
-        assert!(is_hidden_component(Some(".git")));
-        assert!(is_hidden_component(Some(".env")));
-        assert!(!is_hidden_component(Some(".")));
-        assert!(!is_hidden_component(Some("..")));
-        assert!(!is_hidden_component(Some("src")));
-        assert!(!is_hidden_component(None));
-    }
-
-    #[test]
-    fn liteparse_extension_covers_pdf_and_office() {
-        assert!(is_liteparse_extension("pdf"));
-        assert!(is_liteparse_extension("pptx"));
-        assert!(is_liteparse_extension("key"));
-        assert!(is_liteparse_extension("docx"));
-        // Spreadsheets go to markitdown (better tables, no LibreOffice needed).
-        assert!(!is_liteparse_extension("xlsx"));
-        assert!(!is_liteparse_extension("xls"));
-        assert!(!is_liteparse_extension("png"));
-        assert!(!is_liteparse_extension("html"));
-        assert!(!is_liteparse_extension("csv"));
-    }
-
-    #[test]
-    fn office_extension_requires_libreoffice() {
-        assert!(is_office_extension("pptx"));
-        assert!(is_office_extension("docx"));
-        assert!(!is_office_extension("xlsx"));
-        assert!(!is_office_extension("pdf"));
-        assert!(!is_office_extension("png"));
-    }
-
-    #[test]
-    fn extension_of_falls_back_empty() {
-        assert_eq!(extension_of(Path::new("a/b/report.PDF")), "pdf");
-        assert_eq!(extension_of(Path::new("deck.PpTx")), "pptx");
-        assert_eq!(extension_of(Path::new("noext")), "");
     }
 
     #[test]

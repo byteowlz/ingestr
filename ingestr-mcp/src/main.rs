@@ -1,43 +1,45 @@
-//! `ingestr-mcp`: Model Context Protocol server exposing ingestr full-text
-//! search to AI assistants.
+//! `ingestr-mcp`: Model Context Protocol server exposing ingestr document
+//! conversion to AI assistants.
+//!
+//! Built on the official Rust SDK (`rmcp`) and served over stdio. Tools:
+//! `convert_document` (file or URL to Markdown, returned inline),
+//! `convert_to_file` (write Markdown plus extracted images next to an output
+//! path), `supported_formats`, and `doctor`. Conversion runs the `ingestr` CLI
+//! as a subprocess until the pipeline lives in `ingestr-core`
+//! (`ingestr-0frv`); the two binaries never depend on each other.
 
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use config::{Config, Environment, File, FileFormat};
-use env_logger::Env;
-use ingestr_core::SearchIndex;
-use log::{debug, error, info};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::process::{Command, Stdio};
-use std::str;
-use sysinfo::{Pid, System};
+use ingestr_core::formats::{SUPPORTED_EXTENSIONS, extension_of, is_supported_extension};
+use log::{debug, info, warn};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
+use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use serde::Deserialize;
+use tokio::process::Command;
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
-const CONFIG_APP_NAME: &str = "ingestr";
-const CONFIG_ENV_PREFIX: &str = "INGESTR";
 
 #[derive(Debug, Parser)]
 #[command(
     author,
     version,
-    about = "MCP server exposing ingestr search",
+    about = "MCP server exposing ingestr document conversion (stdio transport)",
     propagate_version = true
 )]
 struct Cli {
-    /// Override the config file path
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Override the index directory (highest priority)
-    #[arg(long)]
-    index_dir: Option<PathBuf>,
-    /// Set log level (error, warn, info, debug, trace)
+    /// Path to the `ingestr` CLI binary (default: $INGESTR_BIN, then a sibling
+    /// of this executable, then PATH)
+    #[arg(long, value_name = "PATH", env = "INGESTR_BIN")]
+    ingestr_bin: Option<PathBuf>,
+    /// Maximum seconds a single conversion may take (OCR-heavy inputs are slow)
+    #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+    timeout: u64,
+    /// Set log level (error, warn, info, debug, trace); logs go to stderr
     #[arg(long, default_value = "info")]
     log_level: String,
     /// Emit the MCP client configuration JSON and exit
@@ -45,531 +47,333 @@ struct Cli {
     show_config: bool,
 }
 
-#[derive(Debug, Clone)]
-struct AppPaths {
-    global_config: PathBuf,
-    local_config: PathBuf,
-    active_config: PathBuf,
-    state_dir: PathBuf,
+/// Arguments for `convert_document`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ConvertDocumentArgs {
+    /// Absolute path of the document, or an http(s) URL.
+    path: String,
+    /// Run OCR on scanned pages and images (slower; default false).
+    #[serde(default)]
+    ocr: bool,
+    /// Return the raw conversion without Markdown cleanup (default false).
+    #[serde(default)]
+    raw: bool,
+    /// Truncate the returned Markdown to about this many characters, cutting
+    /// at a section boundary.
+    #[serde(default)]
+    max_chars: Option<usize>,
+    /// Only convert these pages of a PDF, e.g. "1-3,7".
+    #[serde(default)]
+    pages: Option<String>,
+    /// Only return this section, by number ("2.1") or heading text.
+    #[serde(default)]
+    section: Option<String>,
 }
 
-impl AppPaths {
-    fn discover(override_path: Option<PathBuf>) -> Result<Self> {
-        let global_config = default_config_dir()?.join("config.toml");
-        let local_config = env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("config.toml");
-
-        let active_config = match override_path {
-            Some(path) => expand_path(path)?,
-            None => global_config.clone(),
-        };
-
-        if active_config.parent().is_none() {
-            return Err(anyhow!(
-                "invalid config file path: {}",
-                active_config.display()
-            ));
-        }
-
-        let state_dir = default_state_dir()?;
-
-        Ok(Self {
-            global_config,
-            local_config,
-            active_config,
-            state_dir,
-        })
-    }
+/// Arguments for `convert_to_file`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ConvertToFileArgs {
+    /// Absolute path of the document, or an http(s) URL.
+    path: String,
+    /// Output Markdown file path. Extracted images are written next to it.
+    output: String,
+    /// Run OCR on scanned pages and images (slower; default false).
+    #[serde(default)]
+    ocr: bool,
+    /// Write the raw conversion without Markdown cleanup (default false).
+    #[serde(default)]
+    raw: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct AppConfig {
-    index: IndexConfig,
+/// JSON envelope printed by `ingestr convert --json` for a single input.
+#[derive(Debug, Deserialize)]
+struct ConvertEnvelope {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct IndexConfig {
-    index_dir: String,
+#[derive(Clone)]
+struct IngestrMcp {
+    ingestr_bin: PathBuf,
+    timeout: Duration,
 }
 
-impl Default for IndexConfig {
-    fn default() -> Self {
+#[tool_router]
+impl IngestrMcp {
+    fn new(ingestr_bin: PathBuf, timeout: Duration) -> Self {
         Self {
-            index_dir: default_index_dir_string(),
+            ingestr_bin,
+            timeout,
         }
     }
-}
 
-fn main() {
-    if let Err(err) = try_main() {
-        let _ = writeln!(io::stderr(), "{err:?}");
-        std::process::exit(1);
+    #[tool(
+        description = "Convert a document (PDF, Office, HTML, images, ...) or an http(s) URL to Markdown and return it. Use `ocr: true` for scanned pages; use `max_chars` or `section` to keep the result small."
+    )]
+    async fn convert_document(
+        &self,
+        Parameters(args): Parameters<ConvertDocumentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(msg) = validate_input(&args.path) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]));
+        }
+        let mut cli_args: Vec<String> = vec![
+            "convert".into(),
+            args.path.clone(),
+            "--json".into(),
+            "--quiet".into(),
+        ];
+        if args.ocr {
+            cli_args.push("--ocr".into());
+        }
+        if args.raw {
+            cli_args.push("--raw".into());
+        }
+        if let Some(n) = args.max_chars {
+            cli_args.push("--max-chars".into());
+            cli_args.push(n.to_string());
+        }
+        if let Some(p) = &args.pages {
+            cli_args.push("--pages".into());
+            cli_args.push(p.clone());
+        }
+        if let Some(sec) = &args.section {
+            cli_args.push("--section".into());
+            cli_args.push(sec.clone());
+        }
+
+        match self.run_ingestr(&cli_args).await {
+            Ok(stdout) => match serde_json::from_str::<ConvertEnvelope>(&stdout) {
+                Ok(env) if env.ok => {
+                    let mut blocks = vec![ContentBlock::text(env.content)];
+                    if let Some(tokens) = env.tokens {
+                        blocks.push(ContentBlock::text(format!("(approx. {tokens} tokens)")));
+                    }
+                    Ok(CallToolResult::success(blocks))
+                }
+                Ok(_) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "conversion reported failure",
+                )])),
+                Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "could not parse ingestr output: {e}"
+                ))])),
+            },
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )])),
+        }
+    }
+
+    #[tool(
+        description = "Convert a document or URL to Markdown and write it to `output`; embedded images (slides, figures) are written next to it. Returns the output path."
+    )]
+    async fn convert_to_file(
+        &self,
+        Parameters(args): Parameters<ConvertToFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(msg) = validate_input(&args.path) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]));
+        }
+        let mut cli_args: Vec<String> = vec![
+            "convert".into(),
+            args.path.clone(),
+            "--output".into(),
+            args.output.clone(),
+            "--quiet".into(),
+        ];
+        if args.ocr {
+            cli_args.push("--ocr".into());
+        }
+        if args.raw {
+            cli_args.push("--raw".into());
+        }
+        match self.run_ingestr(&cli_args).await {
+            Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "written: {}",
+                args.output
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )])),
+        }
+    }
+
+    #[tool(description = "List the file extensions ingestr can convert.")]
+    fn supported_formats(&self) -> Result<CallToolResult, McpError> {
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            SUPPORTED_EXTENSIONS.join(", "),
+        )]))
+    }
+
+    #[tool(
+        description = "Report which optional external tools (LibreOffice, Poppler, Tesseract, ...) are installed for ingestr."
+    )]
+    async fn doctor(&self) -> Result<CallToolResult, McpError> {
+        match self.run_ingestr(&["doctor".to_string()]).await {
+            Ok(out) => Ok(CallToolResult::success(vec![ContentBlock::text(out)])),
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )])),
+        }
+    }
+
+    /// Run the `ingestr` CLI with `args`, returning its stdout. Non-zero exit
+    /// status is an error carrying the CLI's stderr (its errors are one line
+    /// each, written for humans and agents alike).
+    async fn run_ingestr(&self, args: &[String]) -> Result<String> {
+        debug!("running {} {}", self.ingestr_bin.display(), args.join(" "));
+        let child = Command::new(&self.ingestr_bin)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let output = tokio::time::timeout(self.timeout, child)
+            .await
+            .map_err(|_| anyhow!("conversion timed out after {}s", self.timeout.as_secs()))?
+            .with_context(|| format!("running {}", self.ingestr_bin.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = stderr
+                .lines()
+                .next()
+                .unwrap_or("conversion failed")
+                .to_string();
+            return Err(anyhow!("{msg}"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
 
-fn try_main() -> Result<()> {
-    let cli = Cli::parse();
-    init_logging(&cli.log_level);
+#[tool_handler(router = Self::tool_router())]
+impl ServerHandler for IngestrMcp {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(APP_NAME, env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Converts documents (PDF, Office, HTML, images, URLs) to Markdown with \
+                 ingestr. Prefer `convert_document` with `max_chars` or `section` for \
+                 large files; use `convert_to_file` when the Markdown and extracted \
+                 images should land on disk."
+                    .to_string(),
+            )
+    }
+}
 
-    let paths = AppPaths::discover(cli.config.clone())?;
-    let config = load_or_init_config(&paths, cli.config.as_ref())?;
-
-    if cli.show_config {
-        output_mcp_config()?;
+/// Reject inputs the CLI cannot handle before spawning it: local paths must
+/// exist and have a supported extension; http(s) URLs pass through.
+fn validate_input(input: &str) -> std::result::Result<(), String> {
+    if input.starts_with("http://") || input.starts_with("https://") {
         return Ok(());
     }
-
-    let index_dir = if let Some(custom) = cli.index_dir {
-        expand_path(custom)?
-    } else {
-        expand_str_path(&config.index.index_dir)?
-    };
-
-    info!("starting MCP server with index at {}", index_dir.display());
-
-    ensure_service_running(&paths, &index_dir)?;
-
-    let search_index = SearchIndex::open(&index_dir, false)?;
-    run_server(search_index)?;
-    Ok(())
-}
-
-fn run_server(mut index: SearchIndex) -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut stderr = io::stderr();
-    let lines = stdin.lock().lines();
-
-    for line in lines {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let response = match handle_message(&mut index, &line) {
-            Ok(value) => json!({ "result": value }),
-            Err(err) => {
-                error!("request failed: {err:?}");
-                json!({ "error": err.to_string() })
-            }
-        };
-
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+    let path = Path::new(input);
+    if !path.is_file() {
+        return Err(format!("not a file: {input}"));
     }
-
-    std::thread::sleep(Duration::from_millis(10));
-    let _ = stdout.flush();
-    let _ = stderr.flush();
-    Ok(())
-}
-
-fn handle_message(index: &mut SearchIndex, line: &str) -> Result<serde_json::Value> {
-    let request: serde_json::Value = serde_json::from_str(line)?;
-    let method = request
-        .get("method")
-        .and_then(|m| m.as_str())
-        .ok_or_else(|| anyhow!("missing method"))?;
-
-    match method {
-        "initialize" => Ok(json!({
-            "serverInfo": { "name": APP_NAME, "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": { "tools": true }
-        })),
-        "list_tools" => Ok(json!({
-            "tools": [
-                {
-                    "name": "search",
-                    "description": "Search ingestr markdown index for relevant documents.",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "query": { "type": "string" },
-                            "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
-                        },
-                        "required": ["query"]
-                    }
-                },
-                {
-                    "name": "open_source",
-                    "description": "Open a source document on the local machine (requires confirmation).",
-                    "requires_confirmation": true,
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string" },
-                            "confirm": { "type": "boolean" }
-                        },
-                        "required": ["path"]
-                    }
-                }
-            ]
-        })),
-        "call_tool" => {
-            let params = request
-                .get("params")
-                .and_then(|p| p.as_object())
-                .ok_or_else(|| anyhow!("missing params"))?;
-
-            let name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| anyhow!("missing tool name"))?;
-
-            let args = params
-                .get("arguments")
-                .and_then(|a| a.as_object())
-                .ok_or_else(|| anyhow!("missing arguments"))?;
-
-            match name {
-                "search" => {
-                    let query = args
-                        .get("query")
-                        .and_then(|q| q.as_str())
-                        .ok_or_else(|| anyhow!("missing query"))?;
-                    let limit = args
-                        .get("limit")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(10)
-                        .clamp(1, 50) as usize;
-
-                    let hits = index.search(query, limit)?;
-                    Ok(json!({ "content": hits }))
-                }
-                "open_source" => {
-                    let path_str = args
-                        .get("path")
-                        .and_then(|p| p.as_str())
-                        .ok_or_else(|| anyhow!("missing path"))?;
-                    let confirm = args
-                        .get("confirm")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-
-                    if !confirm {
-                        return Err(anyhow!(
-                            "confirmation required: set confirm=true to open {path_str}"
-                        ));
-                    }
-
-                    let expanded = expand_str_path(path_str)?;
-                    let target = expanded.canonicalize().unwrap_or(expanded);
-
-                    if !target.exists() {
-                        return Err(anyhow!("path does not exist: {}", target.display()));
-                    }
-
-                    open_path(&target)?;
-                    Ok(json!({ "content": format!("opened {}", target.display()) }))
-                }
-                _ => Err(anyhow!("unknown tool: {name}")),
-            }
-        }
-        _ => Err(anyhow!("unknown method: {method}")),
-    }
-}
-
-fn init_logging(level: &str) {
-    let env = Env::default().default_filter_or(level);
-    env_logger::Builder::from_env(env)
-        .format_timestamp_millis()
-        .init();
-}
-
-fn load_or_init_config(paths: &AppPaths, cli_override: Option<&PathBuf>) -> Result<AppConfig> {
-    if !paths.active_config.exists() && cli_override.is_none() {
-        if let Some(parent) = paths.active_config.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating config directory {}", parent.display()))?;
-        }
-        write_default_config(&paths.active_config)?;
-    }
-
-    let env_prefix = env_prefix();
-    let builder = Config::builder()
-        .set_default("index.index_dir", default_index_dir_string())?
-        .add_source(
-            File::from(paths.global_config.as_path())
-                .format(FileFormat::Toml)
-                .required(false),
-        )
-        .add_source(
-            File::from(paths.local_config.as_path())
-                .format(FileFormat::Toml)
-                .required(false),
-        )
-        .add_source(Environment::with_prefix(env_prefix.as_str()).separator("__"))
-        .add_source(
-            File::from(paths.active_config.as_path())
-                .format(FileFormat::Toml)
-                .required(false),
-        );
-
-    let built = builder.build()?;
-    let mut config: AppConfig = built.try_deserialize()?;
-
-    config.index.index_dir = expand_str_path(&config.index.index_dir)?
-        .display()
-        .to_string();
-
-    debug!("effective config: {config:?}");
-    Ok(config)
-}
-
-fn write_default_config(path: &Path) -> Result<()> {
-    let config = AppConfig::default();
-    let toml = toml::to_string_pretty(&config)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating config directory {}", parent.display()))?;
-    }
-    fs::write(path, toml).with_context(|| format!("writing config to {}", path.display()))
-}
-
-fn expand_path(path: PathBuf) -> Result<PathBuf> {
-    path.to_str().map(expand_str_path).unwrap_or(Ok(path))
-}
-
-fn expand_str_path(text: &str) -> Result<PathBuf> {
-    let expanded = shellexpand::full(text).context("expanding path")?;
-    Ok(PathBuf::from(expanded.to_string()))
-}
-
-fn default_config_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        let mut path = PathBuf::from(dir);
-        path.push(CONFIG_APP_NAME);
-        return Ok(path);
-    }
-
-    if let Some(mut dir) = dirs::config_dir() {
-        dir.push(CONFIG_APP_NAME);
-        return Ok(dir);
-    }
-
-    dirs::home_dir()
-        .map(|home| home.join(".config").join(CONFIG_APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine configuration directory"))
-}
-
-fn default_data_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join(CONFIG_APP_NAME));
-    }
-
-    if let Some(mut dir) = dirs::data_dir() {
-        dir.push(CONFIG_APP_NAME);
-        return Ok(dir);
-    }
-
-    dirs::home_dir()
-        .map(|home| home.join(".local").join("share").join(CONFIG_APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine data directory"))
-}
-
-fn default_state_dir() -> Result<PathBuf> {
-    if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir).join(CONFIG_APP_NAME));
-    }
-
-    if let Some(mut dir) = dirs::state_dir() {
-        dir.push(CONFIG_APP_NAME);
-        return Ok(dir);
-    }
-
-    dirs::home_dir()
-        .map(|home| home.join(".local").join("state").join(CONFIG_APP_NAME))
-        .ok_or_else(|| anyhow!("unable to determine state directory"))
-}
-
-fn default_index_dir_string() -> String {
-    default_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("~/.local/share").join(CONFIG_APP_NAME))
-        .join("index")
-        .display()
-        .to_string()
-}
-
-fn env_prefix() -> String {
-    CONFIG_ENV_PREFIX.to_string()
-}
-
-fn open_path(path: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = Command::new("open");
-        c.arg(path);
-        c
-    };
-
-    #[cfg(target_os = "linux")]
-    let mut cmd = {
-        let mut c = Command::new("xdg-open");
-        c.arg(path);
-        c
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", path.to_string_lossy().as_ref()]);
-        c
-    };
-
-    let status = cmd.status()?;
-    if !status.success() {
-        return Err(anyhow!("failed to open {}", path.display()));
-    }
-    Ok(())
-}
-
-fn ensure_service_running(paths: &AppPaths, index_dir: &Path) -> Result<()> {
-    let pid_path = paths.state_dir.join("service.pid");
-
-    if let Some(pid) = read_pid(&pid_path)? {
-        if process_running(pid) {
-            return Ok(());
-        }
-        fs::remove_file(&pid_path).ok();
-    }
-
-    let ingestr_bin = which_ingestr_cli()?;
-
-    let mut cmd = Command::new(ingestr_bin);
-    cmd.arg("service")
-        .arg("start")
-        .arg("--index-dir")
-        .arg(index_dir);
-
-    cmd.arg("--config").arg(&paths.active_config);
-
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
-
-    let output = cmd.output().context("starting ingestr service")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("service already running") {
-            return Ok(());
-        }
-        return Err(anyhow!(
-            "failed to start ingestr service (status {}){}",
-            output.status,
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", stderr.trim())
-            }
+    let ext = extension_of(path);
+    if !is_supported_extension(&ext) {
+        return Err(format!(
+            "unsupported format '.{ext}'; supported: {}",
+            SUPPORTED_EXTENSIONS.join(", ")
         ));
     }
+    Ok(())
+}
 
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
-        if let Some(pid) = read_pid(&pid_path)?
-            && process_running(pid)
-        {
-            info!("ingestr service started pid {pid}");
-            return Ok(());
+/// Locate the `ingestr` CLI: explicit override, then a sibling of this
+/// executable, then PATH.
+fn locate_ingestr(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        if p.is_file() {
+            return Ok(p);
         }
-        std::thread::sleep(Duration::from_millis(100));
+        return Err(anyhow!("ingestr binary not found at {}", p.display()));
     }
-
+    if let Ok(exe) = env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("ingestr");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            let candidate = dir.join("ingestr");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
     Err(anyhow!(
-        "service start did not produce a running process within timeout"
+        "ingestr CLI not found: install ingestr-cli or pass --ingestr-bin / INGESTR_BIN"
     ))
 }
 
-fn read_pid(path: &Path) -> Result<Option<i32>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(path)?;
-    let pid: i32 = text.trim().parse()?;
-    Ok(Some(pid))
-}
-
-fn process_running(pid: i32) -> bool {
-    let mut sys = System::new_all();
-    sys.refresh_processes();
-    sys.process(Pid::from_u32(pid as u32)).is_some()
-}
-
-fn output_mcp_config() -> Result<()> {
-    let ingestr_path = which_ingestr_mcp()?;
-    let config = json!({
-        "name": "ingestr",
-        "command": ingestr_path,
-        "args": [],
+fn output_mcp_config(ingestr_bin: &Path) -> Result<()> {
+    let mcp_bin = env::current_exe().context("resolving current executable")?;
+    let config = serde_json::json!({
+        "mcpServers": {
+            "ingestr": {
+                "command": mcp_bin.display().to_string(),
+                "args": [],
+                "env": { "INGESTR_BIN": ingestr_bin.display().to_string() }
+            }
+        }
     });
     println!("{}", serde_json::to_string_pretty(&config)?);
     Ok(())
 }
 
-fn which_ingestr_mcp() -> Result<String> {
-    if let Ok(current) = env::current_exe()
-        && let Some(name) = current.file_name().and_then(|n| n.to_str())
-        && name.contains("ingestr-mcp")
-    {
-        return Ok(current.display().to_string());
-    }
-    if let Ok(current) = env::current_exe()
-        && let Some(parent) = current.parent()
-    {
-        let sibling = parent.join("ingestr-mcp");
-        if sibling.is_file() {
-            return Ok(sibling.display().to_string());
-        }
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&cli.log_level))
+        .target(env_logger::Target::Stderr)
+        .init();
+
+    let ingestr_bin = locate_ingestr(cli.ingestr_bin)?;
+    if cli.show_config {
+        return output_mcp_config(&ingestr_bin);
     }
 
-    let path = env::var_os("PATH").ok_or_else(|| anyhow!("PATH not set"))?;
-    for entry in env::split_paths(&path) {
-        let candidate = entry.join("ingestr-mcp");
-        if candidate.is_file() {
-            return Ok(candidate.display().to_string());
-        }
-    }
-
-    Err(anyhow!("unable to locate ingestr-mcp binary on PATH"))
-}
-
-fn which_ingestr_cli() -> Result<String> {
-    if let Ok(current) = env::current_exe()
-        && let Some(parent) = current.parent()
-    {
-        let sibling = parent.join("ingestr");
-        if sibling.is_file() {
-            return Ok(sibling.display().to_string());
-        }
-    }
-
-    let path = env::var_os("PATH").ok_or_else(|| anyhow!("PATH not set"))?;
-    for entry in env::split_paths(&path) {
-        let candidate = entry.join("ingestr");
-        if candidate.is_file() {
-            return Ok(candidate.display().to_string());
-        }
-    }
-
-    Err(anyhow!("unable to locate ingestr binary on PATH"))
+    info!(
+        "{APP_NAME} {}: serving over stdio using {}",
+        env!("CARGO_PKG_VERSION"),
+        ingestr_bin.display()
+    );
+    let service = IngestrMcp::new(ingestr_bin, Duration::from_secs(cli.timeout))
+        .serve(rmcp::transport::stdio())
+        .await
+        .inspect_err(|e| warn!("serving error: {e:?}"))?;
+    service.waiting().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
 
     #[test]
-    fn default_config_writes() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        write_default_config(&config_path).unwrap();
-        let body = fs::read_to_string(&config_path).unwrap();
-        assert!(body.contains("index_dir"));
+    fn validate_input_accepts_urls_and_rejects_unknown() {
+        assert!(validate_input("https://example.com/report.pdf").is_ok());
+        assert!(validate_input("/definitely/missing.pdf").is_err());
+        let tmp = env::temp_dir().join("ingestr-mcp-test.exe");
+        std::fs::write(&tmp, b"x").ok();
+        let err = validate_input(&tmp.display().to_string()).unwrap_err();
+        assert!(err.contains("unsupported format"));
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn convert_envelope_parses_cli_json() {
+        let env: ConvertEnvelope =
+            serde_json::from_str(r##"{"ok":true,"source":"a.pdf","tokens":12,"content":"# A"}"##)
+                .unwrap();
+        assert!(env.ok);
+        assert_eq!(env.tokens, Some(12));
+        assert_eq!(env.content, "# A");
     }
 }
