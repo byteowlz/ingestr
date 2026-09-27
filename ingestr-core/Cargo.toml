@@ -10,7 +10,31 @@ description = "Core document conversion library for ingestr (documents to Markdo
 keywords = ["document", "conversion", "markdown", "pdf"]
 categories = ["text-processing"]
 
+[features]
+default = []
+# Derive `clap::ValueEnum` for option enums (used by the CLI).
+clap = ["dep:clap"]
+
 [dependencies]
+anyhow.workspace = true
+clap = { workspace = true, optional = true }
+dirs.workspace = true
+hex.workspace = true
+image.workspace = true
+liteparse.workspace = true
+log.workspace = true
+lopdf.workspace = true
+markitdown.workspace = true
+ocrs.workspace = true
+rayon.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rten.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

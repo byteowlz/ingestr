@@ -3,9 +3,15 @@
 //!
 //! ingestr converts documents to Markdown; it does not index or search them
 //! (see `docs/adr/0003-ingestr-converts-it-does-not-index.md`). This crate is
-//! the dependency root for both binaries. Today it holds the format-routing
-//! vocabulary; the conversion pipeline itself is being moved here from the CLI
-//! (tracked as `ingestr-0frv`) so hosts such as oqto can embed it.
+//! the dependency root for both binaries and the library hosts such as oqto
+//! embed: build a [`pipeline::DocumentProcessor`] from
+//! [`settings::ProcessorSettings`] and call `process(path)`.
+
+pub mod cache;
+pub mod fetch;
+pub mod markdown;
+pub mod pipeline;
+pub mod settings;
 
 pub mod formats {
     //! Which file formats ingestr converts, and which engine handles each.

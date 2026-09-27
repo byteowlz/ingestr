@@ -2404,6 +2404,27 @@ dependencies = [
 [[package]]
 name = "ingestr-core"
 version = "0.3.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs 5.0.1",
+ "hex",
+ "image",
+ "liteparse",
+ "log",
+ "lopdf 0.35.0",
+ "markitdown",
+ "ocrs",
+ "rayon",
+ "regex",
+ "reqwest 0.12.28",
+ "rten",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+]
 
 [[package]]
 name = "ingestr-mcp"
