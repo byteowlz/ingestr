@@ -569,7 +569,7 @@ impl DocumentProcessor {
         let ocr_enabled = self.ocr_enabled
             && !is_office_extension(&ext)
             && (ext != "pdf"
-                || pdf_needs_ocr(input, self.settings.processors.ocr.ocr_sparse_pages));
+                || crate::ocr_gate::pdf_needs_ocr(input, &self.settings.processors.ocr));
         let config = LiteParseConfig {
             output_format: OutputFormat::Markdown,
             ocr_enabled,
@@ -598,8 +598,9 @@ impl DocumentProcessor {
         let mut parser = LiteParse::new(config);
         // Default CPU OCR engine: PP-OCR via the bundled ONNX runtime. An
         // explicit OCR server URL still wins; other backends fall back to
-        // LiteParse's built-in Tesseract for PDF pages.
-        if self.ocr_enabled
+        // LiteParse's built-in Tesseract for PDF pages. Only loaded when the
+        // gate above actually enabled OCR for this document.
+        if ocr_enabled
             && self.ocr_backend == OcrBackend::Paddle
             && self.settings.processors.ocr.ocr_server_url.is_none()
         {
@@ -1813,66 +1814,6 @@ pub(crate) fn layout_ocr_results(mut results: Vec<OcrResult>) -> String {
         .join("\n")
 }
 
-/// Per-page OCR decision from LiteParse's classification: OCR when the page is
-/// scanned, has no text layer, or its text is garbled; a text-sparse page only
-/// when it also carries embedded images (a scan with a small text stamp) or the
-/// caller asked for recall-first behaviour. Pure sparse-text pages are short
-/// native-text pages. Unknown reasons are ignored (LiteParse may add variants).
-pub(crate) fn page_needs_ocr(
-    flagged: bool,
-    reasons: &[liteparse::ocr_merge::ComplexityReason],
-    ocr_sparse_pages: bool,
-) -> bool {
-    use liteparse::ocr_merge::ComplexityReason as R;
-    if !flagged {
-        return false;
-    }
-    let has = |pred: fn(&R) -> bool| reasons.iter().any(pred);
-    let hard = has(|r| matches!(r, R::Scanned | R::NoText | R::Garbled));
-    let sparse = has(|r| matches!(r, R::SparseText));
-    let images = has(|r| matches!(r, R::EmbeddedImages));
-    hard || (sparse && (images || ocr_sparse_pages))
-}
-
-/// Whether a PDF needs OCR at all, decided from a cheap classification pass
-/// (no rendering, no model). Classification failures return `true` so OCR is
-/// never skipped by mistake.
-pub(crate) fn pdf_needs_ocr(path: &Path, ocr_sparse_pages: bool) -> bool {
-    let Some(path_str) = path.to_str() else {
-        return true;
-    };
-    let Ok(rt) = liteparse_runtime() else {
-        return true;
-    };
-    let probe = LiteParse::new(LiteParseConfig {
-        ocr_enabled: false,
-        quiet: true,
-        ..Default::default()
-    });
-    let input = liteparse::types::PdfInput::Path(path_str.to_string());
-    let stats = match rt.block_on(probe.is_complex(input)) {
-        Ok(stats) => stats,
-        Err(e) => {
-            warn!(
-                "page classification failed for {}; OCR-ing anyway: {e}",
-                path.display()
-            );
-            return true;
-        }
-    };
-    let needed = stats
-        .iter()
-        .any(|page| page_needs_ocr(page.needs_ocr, &page.reasons, ocr_sparse_pages));
-    if !needed {
-        debug!(
-            "OCR skipped for {}: {} page(s), none scanned/text-less/garbled",
-            path.display(),
-            stats.len()
-        );
-    }
-    needed
-}
-
 /// Whether an external command is present on PATH. Checks for the binary file
 /// rather than running it (some tools like poppler's pdftoppm exit non-zero on
 /// `--version`, which would misreport them as missing).
@@ -2034,28 +1975,6 @@ mod tests {
             confidence: 0.9,
             polygon: None,
         }
-    }
-
-    #[test]
-    fn page_needs_ocr_rule() {
-        use liteparse::ocr_merge::ComplexityReason as R;
-        // Not flagged by LiteParse at all: never OCR.
-        assert!(!page_needs_ocr(false, &[R::Scanned], false));
-        // Hard cases always OCR.
-        assert!(page_needs_ocr(true, &[R::Scanned], false));
-        assert!(page_needs_ocr(true, &[R::NoText], false));
-        assert!(page_needs_ocr(true, &[R::Garbled], false));
-        // Pure sparse text is a short native page: skip unless recall-first.
-        assert!(!page_needs_ocr(true, &[R::SparseText], false));
-        assert!(page_needs_ocr(true, &[R::SparseText], true));
-        // Sparse text over embedded images (a scan with a stamp): OCR.
-        assert!(page_needs_ocr(
-            true,
-            &[R::SparseText, R::EmbeddedImages],
-            false
-        ));
-        // Images alongside real text: no OCR.
-        assert!(!page_needs_ocr(true, &[R::EmbeddedImages], false));
     }
 
     #[test]
