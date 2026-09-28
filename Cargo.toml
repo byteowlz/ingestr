@@ -153,3 +153,8 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
 cast_possible_wrap = "allow"
+# Optimize dependencies even in dev/test builds: OCR pre/post-processing,
+# image decoding and PDF rendering are ~6x slower unoptimized (5 s vs 0.8 s
+# per scanned page). Our own crates stay at opt-level 0 for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 3
