@@ -44,7 +44,9 @@ enabled = false
 # tesseract, ocrs, surya, easyocr
 backend = "paddle"
 # PP-OCR model size for the paddle backend: tiny | small | medium.
-# Models are downloaded on first use into $OAR_HOME (default ~/.oar).
+# Models are fetched from Hugging Face into the HF cache on first use
+# (sha256-pinned). Set INGESTR_SHARED_HF_HOME to a pre-seeded shared cache,
+# HF_HUB_OFFLINE=1 to forbid downloads.
 paddle_model = "small"
 # Also OCR PDF pages that merely have a sparse native text layer (no embedded
 # images). Off by default: those are short native-text pages and OCR-ing them

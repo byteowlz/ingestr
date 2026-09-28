@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod fetch;
 pub mod markdown;
+pub mod models;
 pub mod pipeline;
 pub mod settings;
 

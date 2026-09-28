@@ -96,7 +96,7 @@ fn try_main() -> Result<()> {
         Command::Config { command } => handle_config(&ctx, command),
         Command::Cache { command } => handle_cache(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
-        Command::Doctor => handle_doctor(),
+        Command::Doctor => handle_doctor(&ctx),
     }
 }
 
@@ -1824,7 +1824,7 @@ fn handle_completions(shell: Shell) -> Result<()> {
 
 /// Report which external tools are installed so users know what conversions
 /// and OCR backends are available without a dependency being silently missing.
-fn handle_doctor() -> Result<()> {
+fn handle_doctor(ctx: &RuntimeContext) -> Result<()> {
     let checks: Vec<(&str, bool, &str, &str)> = vec![
         (
             "LibreOffice (soffice)",
@@ -1874,11 +1874,24 @@ fn handle_doctor() -> Result<()> {
         }
     }
     println!();
-    println!("PDF conversion (LiteParse/PDFium) and search need no external tools.");
+    println!("PDF conversion (LiteParse/PDFium) needs no external tools.");
+    println!("Bundled: PDFium, PP-OCR (paddle, default OCR), Tesseract. Not bundled: LibreOffice.");
+
+    // PP-OCR models: Hugging Face cache, pinned by SHA-256 (ADR-0004).
+    let tier = ingestr_core::models::PpOcrTier::parse(&ctx.config.processors.ocr.paddle_model);
     println!(
-        "Bundled: PDFium, PP-OCR (paddle, default OCR; models auto-download to ~/.oar), \
-         Tesseract. Not bundled: LibreOffice."
+        "\nPP-OCRv6 {} models (Hugging Face, sha256-pinned)",
+        tier.as_str()
     );
+    for m in ingestr_core::models::ppocr_status(tier) {
+        match m.path {
+            Some(p) => println!("✓  {}\n    {}", m.repo, p.display()),
+            None => println!("·  {}\n    not cached; downloaded on first OCR use", m.repo),
+        }
+    }
+    if let Some(shared) = env::var_os(ingestr_core::models::SHARED_HF_HOME_ENV) {
+        println!("    shared cache: {}", PathBuf::from(shared).display());
+    }
     Ok(())
 }
 

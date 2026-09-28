@@ -195,7 +195,7 @@ pub struct OcrConfig {
     /// Languages for OCR
     pub languages: Vec<String>,
     /// PP-OCR model size for the paddle backend: tiny | small | medium.
-    /// Larger is more accurate and slower; models auto-download on first use.
+    /// Larger is more accurate and slower; models come from the Hugging Face cache (ADR-0004).
     pub paddle_model: String,
     /// Also OCR PDF pages whose native text layer is merely sparse and that
     /// carry no embedded images (recall-first). Off by default: such pages are

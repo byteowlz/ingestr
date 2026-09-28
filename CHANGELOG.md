@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PP-OCR models now come from Hugging Face** (ADR-0004): the official `PaddlePaddle/PP-OCRv6_*_onnx` exports, cached in the standard Hugging Face cache and verified against pinned SHA-256 digests, instead of oar's ModelScope mirror in `~/.oar`. A shared read-only cache can be seeded per host (`INGESTR_SHARED_HF_HOME`), `HF_HUB_OFFLINE=1` forbids downloads, and `ingestr doctor` shows where the models are. OCR failures (missing or corrupt models) are now reported instead of showing up as "no text found". `~/.oar` is no longer used.
 - **MCP server rewritten on the official Rust SDK** (`rmcp` 3.4, MCP protocol revision 2026-07-28, stdio). The previous server was a hand-rolled JSON-RPC loop that advertised no protocol version. Tools are now `convert_document` (inline Markdown with `ocr`/`raw`/`max_chars`/`pages`/`section`), `convert_to_file` (Markdown + extracted images on disk), `supported_formats` and `doctor`. It runs the `ingestr` CLI as a subprocess (`--ingestr-bin` / `INGESTR_BIN`, `--timeout`); no config file.
 - `ingestr-core` now holds the format-routing vocabulary (`formats::SUPPORTED_EXTENSIONS`, `is_liteparse_extension`, ...) shared by both binaries; the conversion pipeline follows (`ingestr-0frv`).
 

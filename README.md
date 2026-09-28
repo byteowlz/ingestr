@@ -74,7 +74,7 @@ Commands:
 
 PDF conversion, spreadsheets and OCR need **no external tools**: LiteParse
 bundles PDFium, and the default `paddle` OCR backend bundles an ONNX runtime
-(PP-OCR models are downloaded on first use into `~/.oar`). Converting PPTX/DOCX
+(PP-OCR models are fetched from Hugging Face into the HF cache on first use). Converting PPTX/DOCX
 requires **LibreOffice** (`soffice`); some optional OCR backends use Poppler
 (`pdftoppm`). Run `ingestr doctor` to see what is installed and what is missing.
 
@@ -309,7 +309,7 @@ ingestr-mcp --show-config
 |------|-------------|
 | `$XDG_CONFIG_HOME/ingestr/config.toml` | Configuration file |
 | `$XDG_CACHE_HOME/ingestr/` | Conversion cache (content-hash keyed) |
-| `~/.oar/` | PP-OCR models (downloaded on first OCR use) |
+| `~/.cache/huggingface/hub/` | PP-OCR models (`$HF_HOME`; shared read-only cache via `$INGESTR_SHARED_HF_HOME`; `HF_HUB_OFFLINE=1` forbids downloads) |
 | `$XDG_STATE_HOME/ingestr/service.pid` | Background service PID |
 | `$XDG_STATE_HOME/ingestr/service.log` | Background service logs |
 
