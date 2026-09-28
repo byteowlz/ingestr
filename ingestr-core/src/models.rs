@@ -183,7 +183,10 @@ fn ensure_file(repo: &str, sha256: &str) -> Result<PathBuf> {
         );
     }
     info!("downloading {repo}/{HF_FILE} from Hugging Face (first use)");
+    // Anonymous on purpose: the repos are public, and a stale token in the
+    // user's HF cache would otherwise turn every download into a 401.
     let api = ApiBuilder::from_env()
+        .with_token(None)
         .with_progress(false)
         .build()
         .context("initializing Hugging Face client")?;
