@@ -1,6 +1,7 @@
 //! `ingestr` CLI: convert documents to Markdown (one file, a directory
 //! tree, a URL, or a watched folder). It does not index or search (ADR-0003).
 
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -1432,19 +1433,9 @@ fn handle_convert_directory(
 
     if ctx.common.dry_run {
         let mut plans: Vec<serde_json::Value> = Vec::with_capacity(files.len());
-        for file in &files {
-            let output_path = if in_place {
-                let mut out = file.clone();
-                out.set_extension("md");
-                out.display().to_string()
-            } else if let Some(ref out_dir) = output_dir {
-                let relative = file.strip_prefix(input_dir).unwrap_or(file);
-                let mut out = out_dir.join(relative);
-                out.set_extension("md");
-                out.display().to_string()
-            } else {
-                "-".to_string()
-            };
+        let planned = plan_output_paths(&files, input_dir, output_dir.as_ref(), in_place);
+        for (file, output_path) in files.iter().zip(&planned) {
+            let output_path = output_path.display().to_string();
             if ctx.common.json {
                 plans.push(serde_json::json!({
                     "source": file.display().to_string(),
@@ -1486,6 +1477,7 @@ fn handle_convert_directory(
     let failed = AtomicUsize::new(0);
     let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+    let planned = plan_output_paths(&files, input_dir, output_dir.as_ref(), in_place);
     let results: Vec<Result<ConvertResult>> = if parallel > 1 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(parallel)
@@ -1494,10 +1486,11 @@ fn handle_convert_directory(
             .install(|| {
                 files
                     .par_iter()
-                    .map(|file| {
+                    .zip(planned.par_iter())
+                    .map(|(file, output_path)| {
                         process_file_for_batch(
                             file,
-                            input_dir,
+                            output_path.clone(),
                             output_dir.as_ref(),
                             settings,
                             cmd,
@@ -1526,7 +1519,7 @@ fn handle_convert_directory(
 
             let result = process_file_for_batch(
                 file,
-                input_dir,
+                planned[idx].clone(),
                 output_dir.as_ref(),
                 settings,
                 cmd,
@@ -1637,9 +1630,46 @@ fn batch_output_path(
     }
 }
 
+/// Plan every batch output path up front so no two inputs write the same file.
+///
+/// Normally `dir/report.pdf` -> `out/report.md`. When several inputs map to the
+/// same Markdown path (`parts.csv` + `parts.xlsx`), or the target would be the
+/// source itself (`notes.md` converted in place), each of those keeps its full
+/// file name: `parts.csv.md`, `parts.xlsx.md`, `notes.md.md`.
+fn plan_output_paths(
+    files: &[PathBuf],
+    input_dir: &Path,
+    output_dir: Option<&PathBuf>,
+    in_place: bool,
+) -> Vec<PathBuf> {
+    let defaults: Vec<PathBuf> = files
+        .iter()
+        .map(|f| batch_output_path(f, input_dir, output_dir, in_place))
+        .collect();
+    let mut counts: HashMap<&Path, usize> = HashMap::new();
+    for d in &defaults {
+        *counts.entry(d.as_path()).or_default() += 1;
+    }
+    files
+        .iter()
+        .zip(&defaults)
+        .map(|(file, default)| {
+            let stdout = default.as_os_str() == "-";
+            let clash = counts.get(default.as_path()).copied().unwrap_or(0) > 1
+                || default.as_path() == file.as_path();
+            if stdout || !clash {
+                return default.clone();
+            }
+            let mut name = file.file_name().unwrap_or_default().to_os_string();
+            name.push(".md");
+            default.with_file_name(name)
+        })
+        .collect()
+}
+
 fn process_file_for_batch(
     file: &Path,
-    input_dir: &Path,
+    output_path: PathBuf,
     output_dir: Option<&PathBuf>,
     settings: &ServiceSettings,
     cmd: &ConvertCommand,
@@ -1649,8 +1679,6 @@ fn process_file_for_batch(
     failed: &AtomicUsize,
     errors: &std::sync::Mutex<Vec<String>>,
 ) -> Result<ConvertResult> {
-    let output_path = batch_output_path(file, input_dir, output_dir, in_place);
-
     // Resume: reuse a cached conversion keyed by content hash + flags. This
     // makes re-running a large batch after an interruption cheap, and shared
     // or re-converted documents reuse their prior result. Write the cached
@@ -2805,6 +2833,33 @@ mod tests {
         assert!(!toc[1].has_code);
         assert!(!toc[2].has_table);
         assert!(toc[2].has_code);
+    }
+
+    #[test]
+    fn plan_output_paths_disambiguates_collisions() {
+        let input = Path::new("/in");
+        let out = PathBuf::from("/out");
+        let files: Vec<PathBuf> = [
+            "/in/parts.csv",
+            "/in/parts.xlsx",
+            "/in/report.pdf",
+            "/in/sub/parts.csv",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let planned = plan_output_paths(&files, input, Some(&out), false);
+        assert_eq!(planned[0], PathBuf::from("/out/parts.csv.md"));
+        assert_eq!(planned[1], PathBuf::from("/out/parts.xlsx.md"));
+        assert_eq!(planned[2], PathBuf::from("/out/report.md"));
+        // Same stem in another directory does not collide.
+        assert_eq!(planned[3], PathBuf::from("/out/sub/parts.md"));
+
+        // In place, a Markdown source must never be overwritten by its output.
+        let files = vec![PathBuf::from("/in/notes.md"), PathBuf::from("/in/a.pdf")];
+        let planned = plan_output_paths(&files, input, None, true);
+        assert_eq!(planned[0], PathBuf::from("/in/notes.md.md"));
+        assert_eq!(planned[1], PathBuf::from("/in/a.md"));
     }
 
     #[test]
