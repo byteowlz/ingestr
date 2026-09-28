@@ -2416,6 +2416,7 @@ dependencies = [
  "log",
  "lopdf 0.35.0",
  "markitdown",
+ "oar-ocr",
  "ocrs",
  "rayon",
  "regex",

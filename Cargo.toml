@@ -53,6 +53,9 @@ rten = "0.24.0"
 # against rc.13). The pin is in Cargo.lock and enforced by
 # scripts/drift-check.sh; restore with `cargo update -p ort --precise 2.0.0-rc.12`.
 liteparse = { version = "2", features = ["oar-ocr"] }
+# Direct dep only for OrtSessionConfig (per-engine thread count); same
+# version and features liteparse already pulls in.
+oar-ocr = "0.8"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "process", "time"] }
 # Official MCP Rust SDK (modelcontextprotocol/rust-sdk); implements the stable

@@ -26,6 +26,7 @@ liteparse.workspace = true
 log.workspace = true
 lopdf.workspace = true
 markitdown.workspace = true
+oar-ocr.workspace = true
 ocrs.workspace = true
 rayon.workspace = true
 regex.workspace = true
