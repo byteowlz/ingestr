@@ -62,6 +62,14 @@ sys.exit(failed)
 PY
 FAILED=$?
 
+echo "==> OCR models come from Hugging Face, not oar auto-download (ADR-0004)"
+if grep -v '^\s*#' Cargo.toml */Cargo.toml | grep -q 'oar-ocr-auto-download'; then
+  echo "  FAIL: oar-ocr-auto-download re-enabled; models must go through ingestr-core::models"
+  FAILED=1
+else
+  echo "  ok: oar-ocr-auto-download not enabled"
+fi
+
 echo "==> ort pinned to 2.0.0-rc.12 (oar-ocr 0.8 / liteparse compatibility)"
 # oar-ocr-core 0.8.x declares `ort ^2.0.0-rc.12` but does not compile against
 # rc.13 (removed CPUExecutionProvider). Cargo treats rc pre-releases as

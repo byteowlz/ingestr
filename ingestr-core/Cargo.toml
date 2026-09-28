@@ -20,6 +20,7 @@ anyhow.workspace = true
 clap = { workspace = true, optional = true }
 dirs.workspace = true
 hex.workspace = true
+hf-hub.workspace = true
 image.workspace = true
 liteparse.workspace = true
 log.workspace = true

@@ -378,19 +378,23 @@ impl DocumentProcessor {
         }
 
         // If OCR is enabled and we got empty content, try OCR
-        if self.ocr_enabled
-            && (is_pdf_extension(&extension) || is_image_extension(&extension))
-            && let Ok(ocr_result) = self.process_with_ocr(input)
-            && !ocr_result.text_content.trim().is_empty()
-        {
-            return Ok(ocr_result);
-        }
-
-        if self.ocr_enabled && is_image_extension(&extension) {
-            bail!(
-                "no text found in {} (OCR produced no output)",
-                input.display()
-            );
+        if self.ocr_enabled && (is_pdf_extension(&extension) || is_image_extension(&extension)) {
+            match self.process_with_ocr(input) {
+                Ok(ocr_result) if !ocr_result.text_content.trim().is_empty() => {
+                    return Ok(ocr_result);
+                }
+                Ok(_) if is_image_extension(&extension) => bail!(
+                    "no text found in {} (OCR produced no output)",
+                    input.display()
+                ),
+                // An OCR failure (missing/corrupt models, offline) must not
+                // masquerade as "no text": surface the cause for images.
+                Err(e) if is_image_extension(&extension) => {
+                    return Err(e.context(format!("OCR failed on {}", input.display())));
+                }
+                Err(e) => warn!("OCR failed on {}: {e:#}", input.display()),
+                Ok(_) => {}
+            }
         }
 
         // Fallback: try reading as text
@@ -1750,14 +1754,16 @@ pub(crate) fn paddle_engine(model: &str) -> Result<std::sync::Arc<OarOcrEngine>>
     static ENGINE: OnceLock<Result<std::sync::Arc<OarOcrEngine>, String>> = OnceLock::new();
     ENGINE
         .get_or_init(|| {
-            let size = model.trim().to_ascii_lowercase();
-            info!("paddle: loading PP-OCRv6 {size} (models auto-download on first use)");
-            let built = match size.as_str() {
-                "tiny" => OarOcrEngine::ppocr_v6_tiny(),
-                "medium" => OarOcrEngine::ppocr_v6_medium(),
-                _ => OarOcrEngine::ppocr_v6_small(),
-            };
-            built.map(std::sync::Arc::new).map_err(|e| e.to_string())
+            let tier = crate::models::PpOcrTier::parse(model);
+            info!("paddle: loading PP-OCRv6 {}", tier.as_str());
+            let models = crate::models::ensure_ppocr(tier).map_err(|e| format!("{e:#}"))?;
+            OarOcrEngine::from_models(
+                models.det.as_path(),
+                models.rec.as_path(),
+                models.dict.as_bytes(),
+            )
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string())
         })
         .clone()
         .map_err(|e| anyhow!("initializing paddle OCR engine: {e}"))

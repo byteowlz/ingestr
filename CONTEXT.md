@@ -152,7 +152,7 @@ _Avoid_: office docs (ambiguous)
 **Paddle OCR**:
 The default OCR Backend (`paddle`): PP-OCR models from the PaddleOCR family run
 on a bundled ONNX runtime (via LiteParse's `oar-ocr`), CPU-only. Used for
-scanned PDF pages and standalone images; models auto-download to `~/.oar`.
+scanned PDF pages and standalone images; models come from Hugging Face, sha256-pinned (ADR-0004).
 _Avoid_: PaddleOCR-VL (that is the separate GPU-tier vision model)
 
 **Resume Cache**:
