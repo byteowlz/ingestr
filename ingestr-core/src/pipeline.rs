@@ -14,7 +14,6 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
-use liteparse::ocr::oar::OarOcrEngine;
 // Aliased: ingestr also imports `ocrs::OcrEngine` for the legacy image path.
 use liteparse::ocr::{OcrEngine as LiteOcrEngine, OcrOptions, OcrResult};
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat};
@@ -511,7 +510,7 @@ impl DocumentProcessor {
 
     pub(crate) fn process_with_ocr(&self, input: &Path) -> Result<ConvertedDocument> {
         let text = if self.ocr_backend == OcrBackend::Paddle {
-            run_paddle_on_image(input, &self.settings.processors.ocr.paddle_model)?
+            run_paddle_on_image(input, &self.settings.processors.ocr)?
         } else {
             run_ocr(input, self.ocr_backend, &self.ocr_languages)?
         };
@@ -604,7 +603,7 @@ impl DocumentProcessor {
             && self.ocr_backend == OcrBackend::Paddle
             && self.settings.processors.ocr.ocr_server_url.is_none()
         {
-            match paddle_engine(&self.settings.processors.ocr.paddle_model) {
+            match paddle_engine(&self.settings.processors.ocr) {
                 Ok(engine) => parser = parser.with_ocr_engine(engine),
                 Err(e) => warn!("paddle OCR unavailable ({e}); falling back to built-in tesseract"),
             }
@@ -1674,7 +1673,7 @@ pub(crate) fn run_ocr(input: &Path, backend: OcrBackend, languages: &[String]) -
 
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
-        OcrBackend::Paddle => run_paddle_on_image(input, "small"),
+        OcrBackend::Paddle => run_paddle_on_image(input, &OcrConfig::default()),
         OcrBackend::Ocrs => run_ocrs(input, languages),
         OcrBackend::Surya => {
             // Surya uses Python, call via python
@@ -1745,34 +1744,19 @@ pub(crate) fn map_ocr_lang(lang: &str) -> String {
     .to_string()
 }
 
-/// Process-wide PP-OCR engine (PaddleOCR family via `oar-ocr`/ONNX). Built
-/// once and shared: model loading is the expensive part, and a batch run OCRs
-/// many pages/images with the same engine. The first call downloads the
-/// detection/recognition models and dictionary (SHA-256 verified) into
-/// `$OAR_HOME` (default `~/.oar`).
-pub(crate) fn paddle_engine(model: &str) -> Result<std::sync::Arc<OarOcrEngine>> {
-    static ENGINE: OnceLock<Result<std::sync::Arc<OarOcrEngine>, String>> = OnceLock::new();
-    ENGINE
-        .get_or_init(|| {
-            let tier = crate::models::PpOcrTier::parse(model);
-            info!("paddle: loading PP-OCRv6 {}", tier.as_str());
-            let models = crate::models::ensure_ppocr(tier).map_err(|e| format!("{e:#}"))?;
-            OarOcrEngine::from_models(
-                models.det.as_path(),
-                models.rec.as_path(),
-                models.dict.as_bytes(),
-            )
-            .map(std::sync::Arc::new)
-            .map_err(|e| e.to_string())
-        })
-        .clone()
-        .map_err(|e| anyhow!("initializing paddle OCR engine: {e}"))
+/// The shared PP-OCR engine pool for the configured tier and size.
+pub(crate) fn paddle_engine(ocr: &OcrConfig) -> Result<std::sync::Arc<crate::ocr_pool::OcrPool>> {
+    crate::ocr_pool::ocr_pool(
+        crate::models::PpOcrTier::parse(&ocr.paddle_model),
+        ocr.engines,
+    )
+    .map_err(|e| anyhow!("initializing paddle OCR engine: {e:#}"))
 }
 
 /// OCR a standalone image with the PP-OCR engine and reassemble the word
 /// boxes into reading-order lines.
-pub(crate) fn run_paddle_on_image(input: &Path, model: &str) -> Result<String> {
-    let engine = paddle_engine(model)?;
+pub(crate) fn run_paddle_on_image(input: &Path, ocr: &OcrConfig) -> Result<String> {
+    let engine = paddle_engine(ocr)?;
     let image = image::open(input)
         .with_context(|| format!("reading image for paddle OCR: {}", input.display()))?
         .into_rgb8();

@@ -48,6 +48,9 @@ backend = "paddle"
 # (sha256-pinned). Set INGESTR_SHARED_HF_HOME to a pre-seeded shared cache,
 # HF_HUB_OFFLINE=1 to forbid downloads.
 paddle_model = "small"
+# PP-OCR engines working in parallel (default 1, ~300 MB each). Only helps on
+# hosts with many physical cores; measure before raising.
+# engines = 1
 # Also OCR PDF pages that merely have a sparse native text layer (no embedded
 # images). Off by default: those are short native-text pages and OCR-ing them
 # costs seconds each. Scanned / text-less / garbled pages are always OCR'd.

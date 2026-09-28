@@ -197,6 +197,10 @@ pub struct OcrConfig {
     /// PP-OCR model size for the paddle backend: tiny | small | medium.
     /// Larger is more accurate and slower; models come from the Hugging Face cache (ADR-0004).
     pub paddle_model: String,
+    /// Number of PP-OCR engines working on pages in parallel (0 = default, 1).
+    /// Each engine costs ~300 MB; only worth raising on hosts with many
+    /// physical cores (see `ocr_pool`).
+    pub engines: usize,
     /// Also OCR PDF pages whose native text layer is merely sparse and that
     /// carry no embedded images (recall-first). Off by default: such pages are
     /// almost always short native-text pages, and OCR-ing them costs seconds
@@ -216,6 +220,7 @@ impl Default for OcrConfig {
             backend: OcrBackend::Paddle,
             languages: vec!["eng".to_string()],
             paddle_model: "small".to_string(),
+            engines: 0,
             ocr_sparse_pages: false,
             page_dpi: 300,
             ocr_server_url: None,
