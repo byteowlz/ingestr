@@ -15,6 +15,9 @@ stdout output.
 ## Delta from upstream
 
 - Every `println!(` in the four files above is replaced with `log::debug!(`.
+- The never-read `TableStat.index` field and its `count` counter in `src/pptx.rs`
+  removed (dead-code
+  warning on every build).
 - `log = "0.4"` added as a dependency (`[dependencies.log]`).
 - Registry metadata files (`.cargo-ok`, `.cargo_vcs_info.json`,
   `Cargo.toml.orig`), the crate's own `Cargo.lock`, and its `tests/` fixture

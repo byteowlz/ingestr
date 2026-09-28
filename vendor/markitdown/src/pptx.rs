@@ -47,10 +47,8 @@ impl DocumentConverter for PptxConverter {
 
                 let mut buf = Vec::new();
                 let mut skip_buf = Vec::new();
-                let mut count = 0;
                 #[derive(Debug, Clone)]
                 struct TableStat {
-                    index: u8,
                     rows: Vec<Vec<String>>,
                 }
                 loop {
@@ -94,9 +92,7 @@ impl DocumentConverter for PptxConverter {
                                 }
                             }
                             if let b"a:tbl" = element.name().as_ref() {
-                                count += 1;
                                 let mut stats = TableStat {
-                                    index: count,
                                     rows: vec![],
                                 };
                                 // must define stateful variables
@@ -208,10 +204,8 @@ impl DocumentConverter for PptxConverter {
 
                 let mut buf = Vec::new();
                 let mut skip_buf = Vec::new();
-                let mut count = 0;
                 #[derive(Debug, Clone)]
                 struct TableStat {
-                    index: u8,
                     rows: Vec<Vec<String>>,
                 }
                 loop {
@@ -260,9 +254,7 @@ impl DocumentConverter for PptxConverter {
                                 }
                             }
                             if let b"a:tbl" = element.name().as_ref() {
-                                count += 1;
                                 let mut stats = TableStat {
-                                    index: count,
                                     rows: vec![],
                                 };
                                 // must define stateful variables
