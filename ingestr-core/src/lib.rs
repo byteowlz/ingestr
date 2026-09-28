@@ -11,6 +11,7 @@ pub mod cache;
 pub mod fetch;
 pub mod markdown;
 pub mod models;
+mod ocr_gate;
 pub mod ocr_pool;
 pub mod pipeline;
 pub mod settings;

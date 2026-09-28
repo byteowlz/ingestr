@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OCR gate reads text inside images** (`ingestr-38tn`): with `--ocr`, a PDF page whose embedded images contain text (pasted screenshots, diagrams with labels) is now OCR'd. Previously such pages were skipped as "images alongside text" and that text was lost. ingestr runs only PP-OCR's text-detection model (milliseconds per image) on the page's sizeable images. Photo-only pages no longer trigger OCR. Pages flagged for outlined text or annotation text, and scans carrying a small native stamp, are now OCR'd too. On a 34-page labeled set the gate went from 27 to 32 correct decisions, and every remaining miss only costs time.
+- `--ocr` no longer loads the OCR engine for PDFs that turn out not to need OCR (~0.6 s saved per such file).
+- Batch conversion never lets two inputs write the same Markdown file (`ingestr-91rd`): colliding names such as `report.pdf` / `report.docx` become `report.pdf.md` / `report.docx.md`.
+- PP-OCR models are downloaded anonymously, so a stale Hugging Face token no longer breaks the first OCR run with HTTP 401.
+
 ### Removed
 
 - **Full-text index and search** (ADR-0003): ingestr converts documents; it does not index or search them. `tantivy`, `ingestr search`, `--index-dir`/`--disable-index`, the `[index]` config section and the MCP `search`/`open_source` tools are gone. Search over the Markdown output belongs to the consumer (oqto's own FTS, ripgrep, SQLite). **Breaking** for CLI and config.
