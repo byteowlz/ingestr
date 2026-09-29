@@ -155,6 +155,20 @@ on a bundled ONNX runtime (via LiteParse's `oar-ocr`), CPU-only. Used for
 scanned PDF pages and standalone images; models come from Hugging Face, sha256-pinned (ADR-0004).
 _Avoid_: PaddleOCR-VL (that is the separate GPU-tier vision model)
 
+**Staged Conversion**:
+A PDF conversion delivered in two stages (ADR-0005). Stage 1 is the native
+text, available in milliseconds and handed to a library host's preview
+callback. Stage 2 runs only when OCR or Layout Analysis has more to add, and
+its result replaces stage 1 wholesale.
+_Avoid_: incremental conversion, partial result
+
+**Layout Analysis**:
+Running the layout model (PP-DocLayout_plus-L) on the PDF pages that can hold
+figures the native parse misses (scanned pages, vector figure clusters with
+little text), cropping charts / diagrams / pictures to `fig_pN_K.png` and
+linking them above their captions (`--layout`, ADR-0005).
+_Avoid_: layout parsing (LiteParse's reading-order pass is separate)
+
 **Resume Cache**:
 The content-hash conversion Cache as used by batch conversion: a re-run skips
 files whose content and conversion flags were already converted (`skipped` in

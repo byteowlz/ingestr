@@ -9,6 +9,7 @@
 
 pub mod cache;
 pub mod fetch;
+mod layout;
 pub mod markdown;
 pub mod models;
 mod ocr_gate;

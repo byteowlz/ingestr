@@ -295,6 +295,10 @@ struct ConvertCommand {
     /// OCR languages (comma-separated, e.g., "eng,deu")
     #[arg(long, value_name = "LANGS", value_delimiter = ',')]
     ocr_languages: Option<Vec<String>>,
+    /// Crop charts, diagrams and pictures from PDF pages with a layout model
+    /// and link them in the Markdown (needs -o; ~1 s per figure/scanned page)
+    #[arg(long)]
+    layout: bool,
     /// Include YAML frontmatter with metadata in output
     #[arg(long)]
     meta: bool,
@@ -894,6 +898,10 @@ fn cache_key(path: &Path, cmd: &ConvertCommand) -> Result<String> {
         hasher.update(format!("vlm_model={model}").as_bytes());
     }
     hasher.update(format!("engine={:?}", cmd.engine).as_bytes());
+    // Only hashed when set, so keys of existing cache entries stay valid.
+    if cmd.layout {
+        hasher.update(b"layout=1");
+    }
     if let Some(s) = &cmd.section {
         hasher.update(format!("section={s}").as_bytes());
     }
@@ -1127,6 +1135,7 @@ fn convert_single_input(
             cmd.output.clone(),
         )
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
+        .with_layout(cmd.layout)
         .with_image_output_dir(image_target_dir(cmd.output.as_deref()))
         .with_engine(cmd.engine);
 
@@ -1720,6 +1729,7 @@ fn process_file_for_batch(
             cmd.output.clone(),
         )
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
+        .with_layout(cmd.layout)
         .with_image_output_dir(batch_image_dir(output_dir))
         .with_engine(cmd.engine);
 
@@ -1916,6 +1926,15 @@ fn handle_doctor(ctx: &RuntimeContext) -> Result<()> {
             Some(p) => println!("✓  {}\n    {}", m.repo, p.display()),
             None => println!("·  {}\n    not cached; downloaded on first OCR use", m.repo),
         }
+    }
+    let layout = ingestr_core::models::layout_status();
+    println!("\nLayout model (--layout; Hugging Face, sha256-pinned)");
+    match layout.path {
+        Some(p) => println!("✓  {}\n    {}", layout.repo, p.display()),
+        None => println!(
+            "·  {}\n    not cached; downloaded on first --layout use",
+            layout.repo
+        ),
     }
     if let Some(shared) = env::var_os(ingestr_core::models::SHARED_HF_HOME_ENV) {
         println!("    shared cache: {}", PathBuf::from(shared).display());

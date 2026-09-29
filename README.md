@@ -106,6 +106,10 @@ re-creates missing outputs from the cache). By default only known document
 formats are attempted; use `--extensions pdf,docx` to narrow, `--all-files` to
 try everything, and `--engine liteparse|markitdown` to force an engine. Add
 `--ocr` for scanned documents; it only OCRs pages that actually need it.
+Add `--layout` (with `-o`) to crop charts and diagrams that are drawn as vector
+graphics or sit inside scans into `fig_pN_K.png` files linked from the
+Markdown; it runs a layout model (~125 MB, ~1 s per selected page on CPU) only
+on pages that can hold such figures.
 
 ### Service Commands
 
@@ -309,7 +313,7 @@ ingestr-mcp --show-config
 |------|-------------|
 | `$XDG_CONFIG_HOME/ingestr/config.toml` | Configuration file |
 | `$XDG_CACHE_HOME/ingestr/` | Conversion cache (content-hash keyed) |
-| `~/.cache/huggingface/hub/` | PP-OCR models (`$HF_HOME`; shared read-only cache via `$INGESTR_SHARED_HF_HOME`; `HF_HUB_OFFLINE=1` forbids downloads) |
+| `~/.cache/huggingface/hub/` | PP-OCR and layout models (`$HF_HOME`; shared read-only cache via `$INGESTR_SHARED_HF_HOME`; `HF_HUB_OFFLINE=1` forbids downloads) |
 | `$XDG_STATE_HOME/ingestr/service.pid` | Background service PID |
 | `$XDG_STATE_HOME/ingestr/service.log` | Background service logs |
 
