@@ -63,6 +63,17 @@ page_dpi = 300
 # is delegated to this server instead of liteparse's built-in Tesseract.
 # ocr_server_url = "http://localhost:8000"
 
+[processors.layout]
+# Layout analysis (ADR-0005): crop charts, diagrams and pictures from PDF
+# pages that have vector figures or are scanned, and link the PNGs in the
+# Markdown. Needs an output path (-o). Uses PP-DocLayout_plus-L (~125 MB,
+# Hugging Face, sha256-pinned), ~1 s per selected page on CPU.
+enabled = false
+# Render DPI for layout pages and crops.
+page_dpi = 200
+# Minimum detection score for a region to be cropped.
+min_score = 0.5
+
 [processors.vlm]
 enabled = false
 # model = "gpt-4o"

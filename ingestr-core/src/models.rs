@@ -152,6 +152,28 @@ pub fn ppocr_status(tier: PpOcrTier) -> Vec<ModelStatus> {
         .collect()
 }
 
+/// Layout model (ADR-0005): finds figures, charts and tables on a page image.
+pub const LAYOUT_PIN: (&str, &str) = (
+    "PaddlePaddle/PP-DocLayout_plus-L_onnx",
+    "77afb2caa74dd13240d087d2eced91d7fcd2caebd16006a0a66162fc8707ff0e",
+);
+
+/// Name oar-ocr uses to configure the layout model's pre/post-processing.
+pub const LAYOUT_MODEL_NAME: &str = "pp_doclayout_plus_l";
+
+/// Resolve (and if needed download) the layout model.
+pub fn ensure_layout() -> Result<PathBuf> {
+    ensure_file(LAYOUT_PIN.0, LAYOUT_PIN.1)
+}
+
+/// Report where the layout model is cached, without network access.
+pub fn layout_status() -> ModelStatus {
+    ModelStatus {
+        repo: LAYOUT_PIN.0,
+        path: caches().iter().find_map(|c| cached(c, LAYOUT_PIN.0)),
+    }
+}
+
 fn caches() -> Vec<Cache> {
     let mut out = Vec::new();
     if let Some(shared) = env::var_os(SHARED_HF_HOME_ENV).filter(|v| !v.is_empty()) {
@@ -178,7 +200,7 @@ fn ensure_file(repo: &str, sha256: &str) -> Result<PathBuf> {
     }
     if offline() {
         bail!(
-            "PP-OCR model {repo} is not cached and HF_HUB_OFFLINE is set; \
+            "model {repo} is not cached and HF_HUB_OFFLINE is set; \
              seed ${SHARED_HF_HOME_ENV} or the Hugging Face cache first"
         );
     }

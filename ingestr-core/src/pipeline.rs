@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcCommand;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -112,6 +112,30 @@ pub struct DocumentProcessor {
     pub(crate) image_output_dir: Option<PathBuf>,
     /// Engine selection (auto / liteparse / markitdown).
     pub(crate) engine: ConvertEngine,
+    /// Crop figures with the layout model (ADR-0005).
+    pub(crate) layout_enabled: bool,
+    /// Receives the fast stage-1 document before a slow stage 2 runs.
+    pub(crate) preview: Option<PreviewFn>,
+}
+
+/// Callback receiving the fast stage-1 document (ADR-0005).
+pub type PreviewFn = Arc<dyn Fn(&ConvertedDocument) + Send + Sync>;
+
+/// Rebuild the document text after stage 2 changed some pages' Markdown:
+/// replace each changed page in place, or re-join all pages when a page
+/// cannot be found verbatim.
+pub(crate) fn splice_pages(text: &str, before: &[String], after: &[String]) -> String {
+    let mut out = text.to_string();
+    for (old, new) in before.iter().zip(after) {
+        if old == new {
+            continue;
+        }
+        if old.is_empty() || !out.contains(old.as_str()) {
+            return after.join("\n\n-----\n\n");
+        }
+        out = out.replacen(old.as_str(), new, 1);
+    }
+    out
 }
 
 impl fmt::Debug for DocumentProcessor {
@@ -142,6 +166,8 @@ impl DocumentProcessor {
             ocr_page_dpi: 300,
             image_output_dir: None,
             engine: ConvertEngine::Auto,
+            layout_enabled: false,
+            preview: None,
         }
     }
 
@@ -185,6 +211,20 @@ impl DocumentProcessor {
     /// Write extracted embedded images into this directory.
     pub fn with_image_output_dir(mut self, output_dir: Option<PathBuf>) -> Self {
         self.image_output_dir = output_dir;
+        self
+    }
+
+    /// Enable layout analysis (`enabled` or config): crop figures from PDF
+    /// pages into the image output directory (ADR-0005).
+    pub fn with_layout(mut self, enabled: bool) -> Self {
+        self.layout_enabled = enabled || self.settings.processors.layout.enabled;
+        self
+    }
+
+    /// Receive the fast native-text document before a slow stage (OCR,
+    /// layout) runs. Only called when such a stage follows (ADR-0005).
+    pub fn with_preview(mut self, preview: Option<PreviewFn>) -> Self {
+        self.preview = preview;
         self
     }
 
@@ -570,9 +610,20 @@ impl DocumentProcessor {
             && !is_office_extension(&ext)
             && (ext != "pdf"
                 || crate::ocr_gate::pdf_needs_ocr(input, &self.settings.processors.ocr));
+        // Layout analysis (ADR-0005) crops figures into the image directory,
+        // so it needs one; it only applies to real PDFs (office documents
+        // would be converted by LibreOffice a second time just to render).
+        let layout_cfg = &self.settings.processors.layout;
+        let layout_dir = self
+            .image_output_dir
+            .as_deref()
+            .filter(|_| self.layout_enabled && ext == "pdf");
+        if self.layout_enabled && ext == "pdf" && layout_dir.is_none() {
+            warn!("layout analysis needs an output path for figure images; skipped");
+        }
         let config = LiteParseConfig {
             output_format: OutputFormat::Markdown,
-            ocr_enabled,
+            ocr_enabled: false,
             ocr_language: map_ocr_lang(ocr_lang),
             ocr_server_url: self.settings.processors.ocr.ocr_server_url.clone(),
             dpi: self.ocr_page_dpi as f32,
@@ -585,16 +636,47 @@ impl DocumentProcessor {
             image_output_dir: image_dir,
             ..Default::default()
         };
+        let title = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(std::string::ToString::to_string);
+        let rt = liteparse_runtime()?;
 
+        // Stage 1 (ADR-0005): when a slow stage follows and the host wants a
+        // preview, hand over the native text first. Costs one extra native
+        // parse (milliseconds per page).
+        if (ocr_enabled || layout_dir.is_some())
+            && let Some(preview) = &self.preview
+        {
+            let fast = rt
+                .block_on(LiteParse::new(config.clone()).parse(path_str))
+                .with_context(|| format!("liteparse failed on {}", input.display()))?;
+            info!(
+                "stage 1: {} pages, {} chars (preview)",
+                fast.pages.len(),
+                fast.text.len()
+            );
+            preview(&ConvertedDocument {
+                title: title.clone(),
+                text_content: fast.text,
+                already_written: false,
+            });
+        }
+
+        let config = LiteParseConfig {
+            ocr_enabled,
+            include_complexity: layout_dir.is_some(),
+            ..config
+        };
         info!(
-            "liteparse: parsing {} (ocr={} lang={} server={:?}) in {:.0} DPI",
+            "liteparse: parsing {} (ocr={} layout={} lang={} server={:?}) in {:.0} DPI",
             input.display(),
             config.ocr_enabled,
+            layout_dir.is_some(),
             config.ocr_language,
             config.ocr_server_url,
             config.dpi
         );
-        let rt = liteparse_runtime()?;
         let mut parser = LiteParse::new(config);
         // Default CPU OCR engine: PP-OCR via the bundled ONNX runtime. An
         // explicit OCR server URL still wins; other backends fall back to
@@ -609,7 +691,7 @@ impl DocumentProcessor {
                 Err(e) => warn!("paddle OCR unavailable ({e}); falling back to built-in tesseract"),
             }
         }
-        let result = rt
+        let mut result = rt
             .block_on(parser.parse(path_str))
             .with_context(|| format!("liteparse failed on {}", input.display()))?;
 
@@ -619,10 +701,26 @@ impl DocumentProcessor {
             result.text.len()
         );
 
-        let title = input
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(std::string::ToString::to_string);
+        if let Some(dir) = layout_dir {
+            let before: Vec<String> = result.pages.iter().map(|p| p.markdown.clone()).collect();
+            // A layout failure costs the figure crops, never the text.
+            match crate::layout::add_figures(
+                input,
+                &mut result.pages,
+                &result.images,
+                dir,
+                layout_cfg,
+            ) {
+                Ok(0) => {}
+                Ok(n) => {
+                    info!("layout: added {n} figure(s)");
+                    let after: Vec<String> =
+                        result.pages.iter().map(|p| p.markdown.clone()).collect();
+                    result.text = splice_pages(&result.text, &before, &after);
+                }
+                Err(e) => warn!("layout analysis failed ({e:#}); figures not cropped"),
+            }
+        }
 
         Ok(ConvertedDocument {
             title,
@@ -2118,5 +2216,95 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    /// A one-page PDF with a native text layer (Helvetica, no images).
+    fn text_pdf(text: &str) -> Vec<u8> {
+        let content = format!("BT /F1 18 Tf 72 700 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ),
+        ];
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for off in offsets {
+            pdf.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    fn staged_run(layout: bool) -> Result<(Vec<String>, String)> {
+        let dir = tempfile::tempdir()?;
+        let pdf = dir.path().join("doc.pdf");
+        fs::write(&pdf, text_pdf("Staged conversion works"))?;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let preview: PreviewFn = Arc::new(move |doc: &ConvertedDocument| {
+            if let Ok(mut v) = sink.lock() {
+                v.push(doc.text_content.clone());
+            }
+        });
+        let final_doc = DocumentProcessor::new(ProcessorSettings::default())
+            .with_layout(layout)
+            .with_image_output_dir(Some(dir.path().join("images")))
+            .with_preview(Some(preview))
+            .process(&pdf)?;
+        let previews = seen.lock().map_err(|_| anyhow!("poisoned"))?.clone();
+        Ok((previews, final_doc.text_content))
+    }
+
+    #[test]
+    fn preview_arrives_before_a_slow_stage() -> Result<()> {
+        // Layout on: a slow stage follows, so the native text comes first.
+        // A text-only page never selects layout, so no model is loaded.
+        let (previews, final_text) = staged_run(true)?;
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0].contains("Staged conversion works"));
+        assert_eq!(previews[0], final_text);
+        Ok(())
+    }
+
+    #[test]
+    fn no_preview_without_a_slow_stage() -> Result<()> {
+        let (previews, final_text) = staged_run(false)?;
+        assert!(previews.is_empty());
+        assert!(final_text.contains("Staged conversion works"));
+        Ok(())
+    }
+
+    #[test]
+    fn splice_replaces_only_changed_pages() {
+        let before = vec!["one".to_string(), "two".to_string()];
+        let pages = vec!["one".to_string(), "![](fig_p2_1.png)\n\ntwo".to_string()];
+        assert_eq!(
+            splice_pages("one\n\n-----\n\ntwo", &before, &pages),
+            "one\n\n-----\n\n![](fig_p2_1.png)\n\ntwo"
+        );
+        // A page that cannot be found verbatim forces a re-join.
+        assert_eq!(
+            splice_pages("ONE\n\n-----\n\nTWO", &before, &pages),
+            "one\n\n-----\n\n![](fig_p2_1.png)\n\ntwo"
+        );
     }
 }

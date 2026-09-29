@@ -128,6 +128,8 @@ pub struct ProcessorsConfig {
     pub vlm: VlmConfig,
     /// OCR processor configuration
     pub ocr: OcrConfig,
+    /// Layout analysis (figure crops) configuration
+    pub layout: LayoutConfig,
 }
 
 impl Default for ProcessorsConfig {
@@ -137,6 +139,7 @@ impl Default for ProcessorsConfig {
             routing: HashMap::new(),
             vlm: VlmConfig::default(),
             ocr: OcrConfig::default(),
+            layout: LayoutConfig::default(),
         }
     }
 }
@@ -224,6 +227,30 @@ impl Default for OcrConfig {
             ocr_sparse_pages: false,
             page_dpi: 300,
             ocr_server_url: None,
+        }
+    }
+}
+
+/// Layout analysis (ADR-0005): run a layout model on PDF pages that carry
+/// figures or are scanned, and crop charts / figures / pictures to PNG files
+/// linked from the Markdown. Needs an image output directory.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    /// Enable layout analysis.
+    pub enabled: bool,
+    /// Render DPI for the pages sent to the layout model (and for the crops).
+    pub page_dpi: u32,
+    /// Minimum detection score for a region to be cropped.
+    pub min_score: f32,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            page_dpi: 200,
+            min_score: 0.5,
         }
     }
 }
