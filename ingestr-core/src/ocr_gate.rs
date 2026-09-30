@@ -182,14 +182,33 @@ fn images_have_text(
     Ok(false)
 }
 
-/// Whether a PDF needs OCR at all. Any failure returns `true`, so OCR is
-/// never skipped by mistake.
-pub(crate) fn pdf_needs_ocr(path: &Path, ocr: &OcrConfig) -> bool {
+/// The gate's verdict for one PDF.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OcrPlan {
+    /// Whether the document needs OCR at all.
+    pub(crate) needed: bool,
+    /// 1-based numbers of page-sized scans that are OCR'd in full. These are
+    /// the pages worth checking for orientation.
+    pub(crate) scanned_pages: Vec<u32>,
+}
+
+impl OcrPlan {
+    const fn needed() -> Self {
+        Self {
+            needed: true,
+            scanned_pages: Vec::new(),
+        }
+    }
+}
+
+/// Whether a PDF needs OCR, and which of its pages are full-page scans. Any
+/// failure means "needed", so OCR is never skipped by mistake.
+pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig) -> OcrPlan {
     let Some(path_str) = path.to_str() else {
-        return true;
+        return OcrPlan::needed();
     };
     let Ok(rt) = liteparse_runtime() else {
-        return true;
+        return OcrPlan::needed();
     };
     let probe = LiteParse::new(LiteParseConfig {
         ocr_enabled: false,
@@ -204,14 +223,22 @@ pub(crate) fn pdf_needs_ocr(path: &Path, ocr: &OcrConfig) -> bool {
                 "page classification failed for {}; OCR-ing anyway: {e}",
                 path.display()
             );
-            return true;
+            return OcrPlan::needed();
         }
     };
     let mut image_pages = HashSet::new();
     let mut page_area = 0.0_f32;
+    let mut plan = OcrPlan::default();
     for page in &stats {
         match page_ocr(page, ocr.ocr_sparse_pages) {
-            PageOcr::Yes => return true,
+            PageOcr::Yes => {
+                plan.needed = true;
+                if page.full_page_image
+                    && let Ok(n) = u32::try_from(page.page_number)
+                {
+                    plan.scanned_pages.push(n);
+                }
+            }
             PageOcr::No => {}
             PageOcr::IfImagesHaveText => {
                 image_pages.insert(page.page_number);
@@ -219,30 +246,33 @@ pub(crate) fn pdf_needs_ocr(path: &Path, ocr: &OcrConfig) -> bool {
             }
         }
     }
+    if plan.needed {
+        return plan;
+    }
     if image_pages.is_empty() {
         debug!(
             "OCR skipped for {}: {} page(s), none need it",
             path.display(),
             stats.len()
         );
-        return false;
+        return plan;
     }
     match images_have_text(path_str, &image_pages, page_area, ocr) {
-        Ok(true) => true,
+        Ok(true) => OcrPlan::needed(),
         Ok(false) => {
             debug!(
                 "OCR skipped for {}: embedded images on {} page(s) hold no text",
                 path.display(),
                 image_pages.len()
             );
-            false
+            plan
         }
         Err(e) => {
             warn!(
                 "image text check failed for {}; OCR-ing anyway: {e:#}",
                 path.display()
             );
-            true
+            OcrPlan::needed()
         }
     }
 }
