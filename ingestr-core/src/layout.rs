@@ -239,6 +239,7 @@ pub(crate) fn add_figures(
     images: &[ExtractedImage],
     image_dir: &Path,
     cfg: &LayoutConfig,
+    orientation: &[liteparse::config::PageOrientationCorrection],
 ) -> Result<usize> {
     let selected: Vec<u32> = pages
         .iter()
@@ -261,8 +262,11 @@ pub(crate) fn add_figures(
     info!("layout: analysing pages {selected:?}");
     let det = detector()?;
     let dpi = cfg.page_dpi.max(72);
+    // Same corrections as the parse, so crops of rotated scans come out
+    // upright and match the page coordinates.
     let renderer = LiteParse::new(LiteParseConfig {
         dpi: dpi as f32,
+        page_orientation_corrections: orientation.to_vec(),
         ..Default::default()
     });
     let path = input

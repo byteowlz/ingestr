@@ -603,13 +603,25 @@ impl DocumentProcessor {
         // OCR gating. Office documents always carry a native text layer after
         // the LibreOffice conversion, and most PDFs do too, so only enable OCR
         // when the cheap page classification says a page truly needs it (see
-        // `pdf_needs_ocr`). The gate is per document: once enabled, LiteParse
-        // OCRs every page it flags.
+        // `pdf_ocr_plan`). The gate is per document: once enabled, LiteParse
+        // OCRs every page it flags. Full-page scans are then checked for
+        // orientation, so a sideways or upside-down scan is read upright.
         let ext = extension_of(input);
-        let ocr_enabled = self.ocr_enabled
-            && !is_office_extension(&ext)
-            && (ext != "pdf"
-                || crate::ocr_gate::pdf_needs_ocr(input, &self.settings.processors.ocr));
+        let wants_ocr = self.ocr_enabled && !is_office_extension(&ext);
+        let plan = if wants_ocr && ext == "pdf" {
+            crate::ocr_gate::pdf_ocr_plan(input, &self.settings.processors.ocr)
+        } else {
+            crate::ocr_gate::OcrPlan {
+                needed: wants_ocr,
+                scanned_pages: Vec::new(),
+            }
+        };
+        let ocr_enabled = plan.needed;
+        let orientation = if ocr_enabled {
+            crate::orientation::corrections(input, &plan.scanned_pages)
+        } else {
+            Vec::new()
+        };
         // Layout analysis (ADR-0005) crops figures into the image directory,
         // so it needs one; it only applies to real PDFs (office documents
         // would be converted by LibreOffice a second time just to render).
@@ -666,6 +678,7 @@ impl DocumentProcessor {
         let config = LiteParseConfig {
             ocr_enabled,
             include_complexity: layout_dir.is_some(),
+            page_orientation_corrections: orientation.clone(),
             ..config
         };
         info!(
@@ -710,6 +723,7 @@ impl DocumentProcessor {
                 &result.images,
                 dir,
                 layout_cfg,
+                &orientation,
             ) {
                 Ok(0) => {}
                 Ok(n) => {

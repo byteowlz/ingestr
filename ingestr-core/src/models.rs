@@ -141,15 +141,29 @@ pub fn ensure_ppocr(tier: PpOcrTier) -> Result<PpOcrModels> {
     })
 }
 
-/// Report where each model of `tier` is cached, without network access.
+/// Report where each OCR model of `tier` (plus the page orientation
+/// classifier) is cached, without network access.
 pub fn ppocr_status(tier: PpOcrTier) -> Vec<ModelStatus> {
     tier.pins()
         .iter()
+        .chain(std::iter::once(&DOC_ORIENTATION_PIN))
         .map(|(repo, _)| ModelStatus {
             repo,
             path: caches().iter().find_map(|c| cached(c, repo)),
         })
         .collect()
+}
+
+/// Page orientation classifier (0/90/180/270), run before OCR so rotated
+/// scans are read upright.
+pub const DOC_ORIENTATION_PIN: (&str, &str) = (
+    "PaddlePaddle/PP-LCNet_x1_0_doc_ori_onnx",
+    "af9a0a4f317ff0709ce752067807f819cb15d883f8ecad89f28df1c6ee2d9c92",
+);
+
+/// Resolve (and if needed download) the page orientation classifier.
+pub fn ensure_doc_orientation() -> Result<PathBuf> {
+    ensure_file(DOC_ORIENTATION_PIN.0, DOC_ORIENTATION_PIN.1)
 }
 
 /// Layout model (ADR-0005): finds figures, charts and tables on a page image.
