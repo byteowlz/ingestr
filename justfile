@@ -49,11 +49,11 @@ test:
 
 # Install binaries locally
 install-cli:
-    cargo install --path ingestr-cli
+    cargo install --locked --path ingestr-cli
 
 install-mcp:
-    cargo install --path ingestr-mcp
+    cargo install --locked --path ingestr-mcp
 
 install-all:
-    cargo install --path ingestr-cli
-    cargo install --path ingestr-mcp
+    cargo install --locked --path ingestr-cli
+    cargo install --locked --path ingestr-mcp
