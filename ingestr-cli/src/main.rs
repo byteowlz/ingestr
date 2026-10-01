@@ -98,7 +98,12 @@ fn try_main() -> Result<()> {
         Command::Config { command } => handle_config(&ctx, command),
         Command::Cache { command } => handle_cache(&ctx, command),
         Command::Completions { shell } => handle_completions(shell),
-        Command::Doctor => handle_doctor(&ctx),
+        Command::Doctor { fetch } => {
+            if fetch {
+                fetch_models(&ctx)?;
+            }
+            handle_doctor(&ctx)
+        }
     }
 }
 
@@ -202,8 +207,13 @@ enum Command {
         #[arg(value_enum)]
         shell: Shell,
     },
-    /// Report which external tools are installed (doctor)
-    Doctor,
+    /// Report which external tools and models are installed (doctor)
+    Doctor {
+        /// Download the OCR, orientation and layout models now, so the first
+        /// scanned document does not wait for them
+        #[arg(long)]
+        fetch: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,19 +297,31 @@ struct ConvertCommand {
     /// Number of parallel VLM requests (default: 1)
     #[arg(short = 'j', long = "jobs", value_name = "N", default_value = "1")]
     jobs: usize,
-    /// Enable OCR processing for scanned documents
+    /// Thorough OCR: also read text inside pictures and OCR whole PDFs. Without
+    /// it, OCR runs automatically on pages without usable text only
     #[arg(long)]
     ocr: bool,
+    /// Turn OCR off for this run, even if the config enables it
+    #[arg(long, conflicts_with = "ocr")]
+    no_ocr: bool,
+    /// Auto OCR from config (pages without usable text only); set in
+    /// `handle_convert`.
+    #[arg(skip)]
+    ocr_auto: bool,
     /// OCR backend to use (paddle = bundled PP-OCR ONNX engine, the default)
     #[arg(long, value_name = "BACKEND", value_enum, default_value = "paddle")]
     ocr_backend: OcrBackend,
     /// OCR languages (comma-separated, e.g., "eng,deu")
     #[arg(long, value_name = "LANGS", value_delimiter = ',')]
     ocr_languages: Option<Vec<String>>,
-    /// Crop charts, diagrams and pictures from PDF pages with a layout model
-    /// and link them in the Markdown (needs -o; ~1 s per figure/scanned page)
+    /// Crop charts, diagrams and pictures from every PDF page that has one,
+    /// and link them in the Markdown (needs -o; ~1 s per page). Scanned pages
+    /// get this automatically
     #[arg(long)]
     layout: bool,
+    /// Turn off figure crops, including the automatic ones on scanned pages
+    #[arg(long, conflicts_with = "layout")]
+    no_layout: bool,
     /// Password for encrypted PDFs; repeatable, tried in order. Visible in
     /// the process list: prefer --password-file or INGESTR_PDF_PASSWORDS
     #[arg(long = "password", value_name = "PASSWORD")]
@@ -898,7 +920,11 @@ fn cache_key(path: &Path, cmd: &ConvertCommand) -> Result<String> {
     hasher.update(if cmd.raw { b"raw=1" } else { b"raw=0" });
     hasher.update(if cmd.vlm { b"vlm=1" } else { b"vlm=0" });
     hasher.update(if cmd.ocr { b"ocr=1" } else { b"ocr=0" });
-    if cmd.ocr {
+    // Only hashed when set, so keys of existing cache entries stay valid.
+    if cmd.ocr_auto {
+        hasher.update(b"ocr=auto");
+    }
+    if cmd.ocr || cmd.ocr_auto {
         hasher.update(format!("ocr_backend={}", cmd.ocr_backend).as_bytes());
         if let Some(langs) = &cmd.ocr_languages {
             hasher.update(format!("ocr_langs={}", langs.join("+")).as_bytes());
@@ -913,6 +939,9 @@ fn cache_key(path: &Path, cmd: &ConvertCommand) -> Result<String> {
     // Only hashed when set, so keys of existing cache entries stay valid.
     if cmd.layout {
         hasher.update(b"layout=1");
+    }
+    if cmd.no_layout {
+        hasher.update(b"layout=0");
     }
     if let Some(s) = &cmd.section {
         hasher.update(format!("section={s}").as_bytes());
@@ -1097,6 +1126,13 @@ fn handle_convert(ctx: &RuntimeContext, mut cmd: ConvertCommand) -> Result<()> {
     let is_stdin =
         !cmd.clipboard && (cmd.input.is_none() || cmd.input.as_ref().is_some_and(|s| s == "-"));
     cmd.pdf_passwords = resolve_pdf_passwords(&cmd, is_stdin)?;
+    // Resolve the effective OCR state once, so the cache key and the
+    // processor agree on it.
+    let ocr_config = &ctx.config.processors.ocr;
+    if !cmd.ocr && !cmd.no_ocr && ocr_config.enabled {
+        cmd.ocr_auto = true;
+        cmd.ocr_backend = ocr_config.backend;
+    }
     let settings = ctx.service_settings(&ServiceRunOpts {
         watch_dir: None,
         output_dir: None,
@@ -1189,8 +1225,14 @@ fn convert_single_input(
             cmd.jobs,
             cmd.output.clone(),
         )
-        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
+        .with_ocr(
+            cmd.ocr || cmd.ocr_auto,
+            cmd.ocr_backend,
+            cmd.ocr_languages.clone(),
+        )
+        .with_thorough_ocr(cmd.ocr)
         .with_layout(cmd.layout)
+        .with_layout_auto(!cmd.no_layout)
         .with_pdf_passwords(cmd.pdf_passwords.iter().map(|s| s.0.clone()).collect())
         .with_image_output_dir(image_target_dir(cmd.output.as_deref()))
         .with_engine(cmd.engine);
@@ -1784,8 +1826,14 @@ fn process_file_for_batch(
             cmd.jobs,
             cmd.output.clone(),
         )
-        .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
+        .with_ocr(
+            cmd.ocr || cmd.ocr_auto,
+            cmd.ocr_backend,
+            cmd.ocr_languages.clone(),
+        )
+        .with_thorough_ocr(cmd.ocr)
         .with_layout(cmd.layout)
+        .with_layout_auto(!cmd.no_layout)
         .with_pdf_passwords(cmd.pdf_passwords.iter().map(|s| s.0.clone()).collect())
         .with_image_output_dir(batch_image_dir(output_dir))
         .with_engine(cmd.engine);
@@ -1919,6 +1967,16 @@ fn handle_completions(shell: Shell) -> Result<()> {
 
 /// Report which external tools are installed so users know what conversions
 /// and OCR backends are available without a dependency being silently missing.
+/// Download every model the default pipeline can use (ADR-0004 pins).
+fn fetch_models(ctx: &RuntimeContext) -> Result<()> {
+    let tier = ingestr_core::models::PpOcrTier::parse(&ctx.config.processors.ocr.paddle_model);
+    eprintln!("fetching models (Hugging Face, sha256-pinned)...");
+    ingestr_core::models::ensure_ppocr(tier).context("fetching PP-OCR models")?;
+    ingestr_core::models::ensure_doc_orientation().context("fetching orientation model")?;
+    ingestr_core::models::ensure_layout().context("fetching layout model")?;
+    Ok(())
+}
+
 fn handle_doctor(ctx: &RuntimeContext) -> Result<()> {
     let checks: Vec<(&str, bool, &str, &str)> = vec![
         (
@@ -2070,7 +2128,19 @@ fn write_default_config(path: &Path) -> Result<()> {
     let config = AppConfig::default();
     let toml = toml::to_string_pretty(&config).context("serializing default config to TOML")?;
     let mut body = default_config_header(path)?;
-    body.push_str(&toml);
+    // Commented out, so a newer ingestr's better defaults still apply. Only
+    // lines a user uncomments are pinned.
+    body.push_str(
+        "# Every setting below is the built-in default, commented out so updates\n\
+         # can improve it. Uncomment a line (and its [section]) to pin a value.\n\n",
+    );
+    for line in toml.lines() {
+        if !line.is_empty() {
+            body.push_str("# ");
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
     fs::write(path, body).with_context(|| format!("writing config file to {}", path.display()))
 }
 
@@ -2598,7 +2668,9 @@ mod tests {
         assert_eq!(config.pipeline, vec!["markitdown"]);
         assert!(config.routing.is_empty());
         assert!(!config.vlm.enabled);
-        assert!(!config.ocr.enabled);
+        assert!(config.ocr.enabled);
+        assert!(config.layout.auto);
+        assert!(!config.layout.enabled);
     }
 
     #[test]
@@ -2612,7 +2684,7 @@ mod tests {
     #[test]
     fn ocr_config_default() {
         let config = OcrConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.backend, OcrBackend::Paddle);
         assert_eq!(config.languages, vec!["eng"]);
     }
@@ -2767,6 +2839,69 @@ mod tests {
         let cleaned = clean_markdown(input);
         assert!(cleaned.contains("# Title"));
         assert!(cleaned.contains("## Subtitle"));
+    }
+
+    fn convert_cmd(args: &[&str]) -> Result<ConvertCommand> {
+        let cli = Cli::try_parse_from([&["ingestr", "convert"], args].concat())?;
+        match cli.command {
+            Command::Convert(cmd) => Ok(cmd),
+            _ => anyhow::bail!("not a convert command"),
+        }
+    }
+
+    #[test]
+    fn cache_key_separates_auto_thorough_and_no_ocr() -> Result<()> {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("a.txt");
+        fs::write(&file, "x")?;
+        let mut auto = convert_cmd(&["a.txt"])?;
+        auto.ocr_auto = true;
+        let keys = [
+            cache_key(&file, &auto)?,
+            cache_key(&file, &convert_cmd(&["a.txt", "--ocr"])?)?,
+            cache_key(&file, &convert_cmd(&["a.txt", "--no-ocr"])?)?,
+            cache_key(&file, &convert_cmd(&["a.txt", "--no-layout"])?)?,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(convert_cmd(&["a.txt", "--ocr", "--no-ocr"]).is_err());
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn written_default_config_pins_nothing() -> Result<()> {
+        let dir = unique_temp_dir();
+        let path = dir.join("config.toml");
+        write_default_config(&path)?;
+        let body = fs::read_to_string(&path)?;
+        assert!(body.contains("# enabled = true"), "{body}");
+        let pinned: toml::Table = toml::from_str(&body)?;
+        assert!(pinned.is_empty(), "{pinned:?}");
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clean_markdown_keeps_code_fences_intact() {
+        let input = "Intro\n\n```\nresearch@example.com\n```\n\nnext paragraph";
+        let cleaned = clean_markdown(input);
+        assert!(
+            cleaned.contains("```\nresearch@example.com\n```"),
+            "{cleaned}"
+        );
+    }
+
+    #[test]
+    fn clean_markdown_does_not_drop_repeated_fences() {
+        let block = "```\ncode line\n```\n\nsome prose here.\n\n";
+        let input = block.repeat(40);
+        let cleaned = clean_markdown(&input);
+        assert_eq!(cleaned.matches("```").count(), 80);
     }
 
     #[test]

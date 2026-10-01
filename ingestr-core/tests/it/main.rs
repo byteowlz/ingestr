@@ -2,5 +2,6 @@
 //! links ONNX Runtime and PDFium, so separate files multiply link time and
 //! memory.
 
+mod auto_ocr;
 mod encrypted_pdfs;
 mod spreadsheets;

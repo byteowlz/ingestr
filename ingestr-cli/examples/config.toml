@@ -38,8 +38,9 @@ model = "gpt-4o"
 # api_key = "sk-..."
 
 [processors.ocr]
-# Enable OCR processing (as a fallback for scanned or image-only inputs)
-enabled = false
+# OCR scanned pages and images. A cheap per-page check keeps PDFs with a text
+# layer off the OCR path. Turn off per run with --no-ocr.
+enabled = true
 # OCR backend: paddle (default; bundled PP-OCR ONNX engine, CPU-only),
 # tesseract, ocrs, surya, easyocr
 backend = "paddle"
@@ -74,7 +75,10 @@ page_dpi = 300
 # pages that have vector figures or are scanned, and link the PNGs in the
 # Markdown. Needs an output path (-o). Uses PP-DocLayout_plus-L (~125 MB,
 # Hugging Face, sha256-pinned), ~1 s per selected page on CPU.
+# Every page with a figure (as --layout):
 enabled = false
+# Scanned pages only, automatically (--no-layout turns it off):
+auto = true
 # Render DPI for layout pages and crops.
 page_dpi = 200
 # Minimum detection score for a region to be cropped.

@@ -207,7 +207,8 @@ impl Default for VlmConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OcrConfig {
-    /// Enable OCR processing
+    /// OCR scanned pages and images (default true). A cheap per-page check
+    /// keeps PDFs with a text layer off the OCR path.
     pub enabled: bool,
     /// OCR backend (paddle, tesseract, ocrs, surya, easyocr)
     pub backend: OcrBackend,
@@ -235,7 +236,7 @@ pub struct OcrConfig {
 impl Default for OcrConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             backend: OcrBackend::Paddle,
             languages: vec!["eng".to_string()],
             paddle_model: "small".to_string(),
@@ -253,8 +254,11 @@ impl Default for OcrConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LayoutConfig {
-    /// Enable layout analysis.
+    /// Layout analysis on every page with a figure (as `--layout`).
     pub enabled: bool,
+    /// Crop figures on scanned pages automatically (default true). Text
+    /// pages are never sent to the layout model in this mode.
+    pub auto: bool,
     /// Render DPI for the pages sent to the layout model (and for the crops).
     pub page_dpi: u32,
     /// Minimum detection score for a region to be cropped.
@@ -265,6 +269,7 @@ impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto: true,
             page_dpi: 200,
             min_score: 0.5,
         }

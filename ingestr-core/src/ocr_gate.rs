@@ -192,6 +192,9 @@ pub(crate) struct OcrPlan {
     /// 1-based numbers of page-sized scans that are OCR'd in full. These are
     /// the pages worth checking for orientation.
     pub(crate) scanned_pages: Vec<u32>,
+    /// 1-based pages to OCR, the rest keep their native text. `None` means
+    /// the whole document goes through OCR.
+    pub(crate) pages: Option<Vec<u32>>,
 }
 
 impl OcrPlan {
@@ -199,13 +202,24 @@ impl OcrPlan {
         Self {
             needed: true,
             scanned_pages: Vec::new(),
+            pages: None,
         }
     }
 }
 
 /// Whether a PDF needs OCR, and which of its pages are full-page scans. Any
 /// failure means "needed", so OCR is never skipped by mistake.
-pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig, password: Option<&str>) -> OcrPlan {
+///
+/// `thorough` (an explicit `--ocr`) also reads text inside pictures on pages
+/// that have a text layer, and OCRs the whole document. Otherwise (auto mode,
+/// the default) only pages without usable text are OCR'd, page by page, so a
+/// text PDF with a logo stays on the fast path.
+pub(crate) fn pdf_ocr_plan(
+    path: &Path,
+    ocr: &OcrConfig,
+    password: Option<&str>,
+    thorough: bool,
+) -> OcrPlan {
     let Some(path_str) = path.to_str() else {
         return OcrPlan::needed();
     };
@@ -232,10 +246,14 @@ pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig, password: Option<&str>)
     let mut image_pages = HashSet::new();
     let mut page_area = 0.0_f32;
     let mut plan = OcrPlan::default();
+    let mut ocr_pages = Vec::new();
     for page in &stats {
         match page_ocr(page, ocr.ocr_sparse_pages) {
             PageOcr::Yes => {
                 plan.needed = true;
+                if let Ok(n) = u32::try_from(page.page_number) {
+                    ocr_pages.push(n);
+                }
                 if page.full_page_image
                     && let Ok(n) = u32::try_from(page.page_number)
                 {
@@ -248,6 +266,18 @@ pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig, password: Option<&str>)
                 page_area = page_area.max(page.page_area);
             }
         }
+    }
+    if !thorough {
+        debug!(
+            "auto OCR for {}: {} of {} page(s) need it",
+            path.display(),
+            ocr_pages.len(),
+            stats.len()
+        );
+        if ocr_pages.len() < stats.len() {
+            plan.pages = Some(ocr_pages);
+        }
+        return plan;
     }
     if plan.needed {
         return plan;

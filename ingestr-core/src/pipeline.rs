@@ -2,7 +2,7 @@
 //! gating and backends, VLM, and the optional semantic router.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -107,6 +107,8 @@ pub struct DocumentProcessor {
     pub(crate) ocr_languages: Vec<String>,
     /// Render DPI used for OCR-ing scanned pages.
     pub(crate) ocr_page_dpi: u32,
+    /// Explicit `--ocr`: also read text inside pictures and OCR whole PDFs.
+    pub(crate) ocr_thorough: bool,
     /// Directory where LiteParse writes extracted embedded images (e.g. figures
     /// / charts from a PPTX). `None` keeps image references in the Markdown
     /// without writing image files.
@@ -115,6 +117,8 @@ pub struct DocumentProcessor {
     pub(crate) engine: ConvertEngine,
     /// Crop figures with the layout model (ADR-0005).
     pub(crate) layout_enabled: bool,
+    /// Crop figures on scanned pages only (`processors.layout.auto`).
+    pub(crate) layout_auto: bool,
     /// Receives the fast stage-1 document before a slow stage 2 runs.
     pub(crate) preview: Option<PreviewFn>,
     /// Candidate passwords for encrypted PDFs.
@@ -127,6 +131,35 @@ pub type PreviewFn = Arc<dyn Fn(&ConvertedDocument) + Send + Sync>;
 /// Rebuild the document text after stage 2 changed some pages' Markdown:
 /// replace each changed page in place, or re-join all pages when a page
 /// cannot be found verbatim.
+/// Fewer letters/digits than this and a converted document counts as
+/// nearly empty.
+const NEARLY_EMPTY_CHARS: usize = 20;
+
+/// Replace the native pages of `native` with their OCR'd versions and
+/// rebuild the document text (LiteParse joins page Markdown with a rule).
+fn merge_ocr_pages(native: &mut liteparse::ParseResult, ocr: liteparse::ParseResult) {
+    let ocr_pages: HashSet<usize> = ocr.pages.iter().map(|p| p.page_number).collect();
+    native
+        .images
+        .retain(|img| !ocr_pages.contains(&(img.page as usize)));
+    native.images.extend(ocr.images);
+    for page in ocr.pages {
+        if let Some(slot) = native
+            .pages
+            .iter_mut()
+            .find(|p| p.page_number == page.page_number)
+        {
+            *slot = page;
+        }
+    }
+    native.text = native
+        .pages
+        .iter()
+        .map(|p| p.markdown.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n-----\n\n");
+}
+
 pub(crate) fn splice_pages(text: &str, before: &[String], after: &[String]) -> String {
     let mut out = text.to_string();
     for (old, new) in before.iter().zip(after) {
@@ -153,10 +186,20 @@ impl fmt::Debug for DocumentProcessor {
 }
 
 impl DocumentProcessor {
-    /// Create a processor with defaults (no VLM, no OCR, `auto` engine).
+    /// Create a processor with defaults: no VLM, `auto` engine, and OCR as
+    /// configured in `processors.ocr` (on by default; the per-page gate keeps
+    /// text PDFs on the fast path).
     pub fn new(settings: ProcessorSettings) -> Self {
         let pdf_passwords =
             PdfPasswords::new(Vec::new(), settings.processors.pdf.password_command.clone());
+        let layout_auto = settings.processors.layout.auto;
+        let ocr = &settings.processors.ocr;
+        let (ocr_enabled, ocr_backend, ocr_languages, ocr_page_dpi) = (
+            ocr.enabled,
+            ocr.backend,
+            ocr.languages.clone(),
+            ocr.page_dpi.max(72),
+        );
         Self {
             markitdown: MarkItDown::new(),
             settings,
@@ -165,13 +208,15 @@ impl DocumentProcessor {
             vlm_prompt: None,
             jobs: 1,
             vlm_output: None,
-            ocr_enabled: false,
-            ocr_backend: OcrBackend::Paddle,
-            ocr_languages: vec!["eng".to_string()],
-            ocr_page_dpi: 300,
+            ocr_enabled,
+            ocr_backend,
+            ocr_languages,
+            ocr_page_dpi,
+            ocr_thorough: false,
             image_output_dir: None,
             engine: ConvertEngine::Auto,
             layout_enabled: false,
+            layout_auto,
             preview: None,
             pdf_passwords,
         }
@@ -206,14 +251,15 @@ impl DocumentProcessor {
         self
     }
 
-    /// Enable OCR (`enabled` or config) with the given backend and languages.
+    /// Turn OCR on or off (overriding `processors.ocr.enabled`) with the
+    /// given backend and languages.
     pub fn with_ocr(
         mut self,
         enabled: bool,
         backend: OcrBackend,
         languages: Option<Vec<String>>,
     ) -> Self {
-        self.ocr_enabled = enabled || self.settings.processors.ocr.enabled;
+        self.ocr_enabled = enabled;
         if enabled {
             self.ocr_backend = backend;
         } else {
@@ -231,10 +277,25 @@ impl DocumentProcessor {
         self
     }
 
+    /// Thorough OCR (an explicit `--ocr`): besides pages without usable text,
+    /// also read text inside pictures, and OCR the whole PDF. The default
+    /// (auto) OCRs only the pages that need it.
+    pub fn with_thorough_ocr(mut self, thorough: bool) -> Self {
+        self.ocr_thorough = thorough;
+        self
+    }
+
     /// Enable layout analysis (`enabled` or config): crop figures from PDF
     /// pages into the image output directory (ADR-0005).
     pub fn with_layout(mut self, enabled: bool) -> Self {
         self.layout_enabled = enabled || self.settings.processors.layout.enabled;
+        self
+    }
+
+    /// Automatic figure crops on scanned pages, on when
+    /// `processors.layout.auto` is; `false` turns them off.
+    pub fn with_layout_auto(mut self, enabled: bool) -> Self {
+        self.layout_auto = self.layout_auto && enabled;
         self
     }
 
@@ -342,6 +403,41 @@ impl DocumentProcessor {
 
     /// Convert one file to Markdown.
     pub fn process(&self, input: &Path) -> Result<ConvertedDocument> {
+        let doc = self.process_inner(input)?;
+        self.warn_if_nearly_empty(input, &doc);
+        Ok(doc)
+    }
+
+    /// A document that should hold text but came back (almost) empty gets a
+    /// warning with the likely way out, instead of silently empty Markdown.
+    fn warn_if_nearly_empty(&self, input: &Path, doc: &ConvertedDocument) {
+        let ext = extension_of(input);
+        if !(is_pdf_extension(&ext) || is_image_extension(&ext) || is_office_extension(&ext)) {
+            return;
+        }
+        let letters = doc
+            .text_content
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(NEARLY_EMPTY_CHARS)
+            .count();
+        if doc.already_written || letters >= NEARLY_EMPTY_CHARS {
+            return;
+        }
+        let hint = if !self.ocr_enabled {
+            "OCR is off; drop --no-ocr or set processors.ocr.enabled = true"
+        } else if !self.vlm_enabled {
+            "if it is a photo or handwriting, try --vlm"
+        } else {
+            "the document may really hold no text"
+        };
+        warn!(
+            "{} produced almost no text ({letters} letters/digits); {hint}",
+            input.display()
+        );
+    }
+
+    fn process_inner(&self, input: &Path) -> Result<ConvertedDocument> {
         let extension = input
             .extension()
             .and_then(|e| e.to_str())
@@ -615,11 +711,17 @@ impl DocumentProcessor {
         let ext = extension_of(input);
         let wants_ocr = self.ocr_enabled && !is_office_extension(&ext);
         let plan = if wants_ocr && ext == "pdf" {
-            crate::ocr_gate::pdf_ocr_plan(input, &self.settings.processors.ocr, pdf_password)
+            crate::ocr_gate::pdf_ocr_plan(
+                input,
+                &self.settings.processors.ocr,
+                pdf_password,
+                self.ocr_thorough,
+            )
         } else {
             crate::ocr_gate::OcrPlan {
                 needed: wants_ocr,
                 scanned_pages: Vec::new(),
+                pages: None,
             }
         };
         let ocr_enabled = plan.needed;
@@ -632,10 +734,16 @@ impl DocumentProcessor {
         // so it needs one; it only applies to real PDFs (office documents
         // would be converted by LibreOffice a second time just to render).
         let layout_cfg = &self.settings.processors.layout;
+        // Auto layout: figure crops on scanned pages only, so a text PDF never
+        // loads the layout model.
+        let layout_auto = self.layout_auto
+            && !self.layout_enabled
+            && ocr_enabled
+            && !plan.scanned_pages.is_empty();
         let layout_dir = self
             .image_output_dir
             .as_deref()
-            .filter(|_| self.layout_enabled && ext == "pdf");
+            .filter(|_| (self.layout_enabled || layout_auto) && ext == "pdf");
         if self.layout_enabled && ext == "pdf" && layout_dir.is_none() {
             warn!("layout analysis needs an output path for figure images; skipped");
         }
@@ -653,8 +761,12 @@ impl DocumentProcessor {
             extract_images: image_dir.is_some(),
             image_output_dir: image_dir,
             password: pdf_password.map(str::to_string),
+            include_complexity: layout_dir.is_some(),
             ..Default::default()
         };
+        // Per-page OCR: only these pages are OCR'd; the native pass supplies
+        // the rest.
+        let ocr_pages = plan.pages.clone().filter(|_| ocr_enabled);
         let title = input
             .file_stem()
             .and_then(|s| s.to_str())
@@ -664,28 +776,39 @@ impl DocumentProcessor {
         // Stage 1 (ADR-0005): when a slow stage follows and the host wants a
         // preview, hand over the native text first. Costs one extra native
         // parse (milliseconds per page).
-        if (ocr_enabled || layout_dir.is_some())
-            && let Some(preview) = &self.preview
-        {
+        // The same native pass is the base that per-page OCR patches.
+        let wants_preview = (ocr_enabled || layout_dir.is_some()) && self.preview.is_some();
+        let native = if wants_preview || ocr_pages.is_some() {
             let fast = rt
                 .block_on(LiteParse::new(config.clone()).parse(path_str))
                 .with_context(|| format!("liteparse failed on {}", input.display()))?;
             info!(
-                "stage 1: {} pages, {} chars (preview)",
+                "stage 1: {} pages, {} chars (native)",
                 fast.pages.len(),
                 fast.text.len()
             );
-            preview(&ConvertedDocument {
-                title: title.clone(),
-                text_content: fast.text,
-                already_written: false,
-            });
-        }
+            if let Some(preview) = self.preview.as_ref().filter(|_| wants_preview) {
+                preview(&ConvertedDocument {
+                    title: title.clone(),
+                    text_content: fast.text.clone(),
+                    already_written: false,
+                });
+            }
+            Some(fast)
+        } else {
+            None
+        };
 
         let config = LiteParseConfig {
             ocr_enabled,
-            include_complexity: layout_dir.is_some(),
             page_orientation_corrections: orientation.clone(),
+            target_pages: ocr_pages.as_ref().map(|pages| {
+                pages
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
             ..config
         };
         info!(
@@ -711,9 +834,17 @@ impl DocumentProcessor {
                 Err(e) => warn!("paddle OCR unavailable ({e}); falling back to built-in tesseract"),
             }
         }
-        let mut result = rt
+        let parsed = rt
             .block_on(parser.parse(path_str))
             .with_context(|| format!("liteparse failed on {}", input.display()))?;
+        let mut result = match (native, &ocr_pages) {
+            (Some(mut native), Some(pages)) => {
+                info!("OCR'd {} of {} page(s)", pages.len(), native.pages.len());
+                merge_ocr_pages(&mut native, parsed);
+                native
+            }
+            _ => parsed,
+        };
 
         info!(
             "liteparse: {} pages, {} chars",
@@ -732,6 +863,7 @@ impl DocumentProcessor {
                 layout_cfg,
                 &orientation,
                 pdf_password,
+                layout_auto,
             ) {
                 Ok(0) => {}
                 Ok(n) => {
