@@ -1,8 +1,58 @@
-use calamine::{open_workbook, Reader, Xlsx};
-use std::{io::Cursor, path::Path};
+use calamine::{open_workbook_auto, open_workbook_auto_from_rs, Reader};
+use std::io::Cursor;
+use std::path::Path;
 
 use crate::error::MarkitdownError;
 use crate::model::{ConversionOptions, DocumentConverter, DocumentConverterResult};
+
+/// Render the first worksheet of any calamine `Reader` (Xlsx or legacy Xls)
+/// into a Markdown table, preserving the header row.
+fn render_worksheet<R, RS>(workbook: &mut R) -> String
+where
+    R: Reader<RS>,
+    RS: std::io::Read + std::io::Seek,
+{
+    let mut markdown = String::new();
+
+    if let Some(Ok(range)) = workbook.worksheet_range_at(0) {
+        let rows: Vec<Vec<String>> = range
+            .rows()
+            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .collect();
+
+        if rows.is_empty() {
+            return markdown;
+        }
+
+        markdown.push_str("|");
+        for cell in &rows[0] {
+            markdown.push_str(&format!(" {} |", cell));
+        }
+        markdown.push_str("\n|");
+
+        for _ in &rows[0] {
+            markdown.push_str(" --- |");
+        }
+        markdown.push_str("\n");
+
+        for row in rows.iter().skip(1) {
+            markdown.push_str("|");
+            for cell in row {
+                markdown.push_str(&format!(" {} |", cell));
+            }
+            markdown.push_str("\n");
+        }
+    }
+
+    markdown
+}
+
+fn is_excel_ext(ext: Option<&str>) -> bool {
+    matches!(
+        ext,
+        Some(".xlsx") | Some(".xls") | Some(".xlsm") | Some(".xlsb")
+    )
+}
 
 pub struct ExcelConverter;
 
@@ -14,9 +64,9 @@ impl DocumentConverter for ExcelConverter {
     ) -> Result<DocumentConverterResult, MarkitdownError> {
         if let Some(opts) = &args {
             if let Some(ext) = &opts.file_extension {
-                if ext != ".xlsx" && ext != ".xls" {
+                if !is_excel_ext(Some(ext)) {
                     return Err(MarkitdownError::InvalidFile(
-                        format!("Expected .xlsx or .xls file, got {}", ext)
+                        format!("Expected an Excel file, got {}", ext)
                     ));
                 }
             }
@@ -24,46 +74,14 @@ impl DocumentConverter for ExcelConverter {
 
         let path = Path::new(local_path);
         log::debug!("Opening file: {:#?}", path);
-        let mut workbook: Xlsx<_> = open_workbook(path)
+        // Auto-detects the workbook format (XlsxOLE2 legacy Xls, xlsx, xlsb) so
+        // old binary .xls files are no longer rejected by the Xlsx-only reader.
+        let mut workbook = open_workbook_auto(path)
             .map_err(|e| MarkitdownError::ParseError(format!("Failed to open Excel file: {}", e)))?;
-        let mut markdown = String::new();
-
-        if let Some(Ok(range)) = workbook.worksheet_range_at(0) {
-            let rows: Vec<Vec<String>> = range
-                .rows()
-                .map(|row| row.iter().map(|cell| cell.to_string()).collect())
-                .collect();
-
-            if rows.is_empty() {
-                return Ok(DocumentConverterResult {
-                    title: None,
-                    text_content: String::new(),
-                });
-            }
-
-            markdown.push_str("|");
-            for cell in &rows[0] {
-                markdown.push_str(&format!(" {} |", cell));
-            }
-            markdown.push_str("\n|");
-
-            for _ in &rows[0] {
-                markdown.push_str(" --- |");
-            }
-            markdown.push_str("\n");
-
-            for row in rows.iter().skip(1) {
-                markdown.push_str("|");
-                for cell in row {
-                    markdown.push_str(&format!(" {} |", cell));
-                }
-                markdown.push_str("\n");
-            }
-        }
 
         Ok(DocumentConverterResult {
             title: None,
-            text_content: markdown,
+            text_content: render_worksheet(&mut workbook),
         })
     }
 
@@ -74,55 +92,21 @@ impl DocumentConverter for ExcelConverter {
     ) -> Result<DocumentConverterResult, MarkitdownError> {
         if let Some(opts) = &args {
             if let Some(ext) = &opts.file_extension {
-                if ext != ".xlsx" && ext != ".xls" {
+                if !is_excel_ext(Some(ext)) {
                     return Err(MarkitdownError::InvalidFile(
-                        format!("Expected .xlsx or .xls file, got {}", ext)
+                        format!("Expected an Excel file, got {}", ext)
                     ));
                 }
             }
         }
         let reader = Cursor::new(bytes);
-        let mut workbook: Xlsx<_> = Xlsx::new(reader)
+        // Auto-detect the workbook format (xlsx / legacy xls / xlsb) from bytes.
+        let mut workbook = open_workbook_auto_from_rs(reader)
             .map_err(|e| MarkitdownError::ParseError(format!("Failed to open Excel file: {}", e)))?;
-
-        let mut markdown = String::new();
-
-        if let Some(Ok(range)) = workbook.worksheet_range_at(0) {
-            let rows: Vec<Vec<String>> = range
-                .rows()
-                .map(|row| row.iter().map(|cell| cell.to_string()).collect())
-                .collect();
-
-            if rows.is_empty() {
-                return Ok(DocumentConverterResult {
-                    title: None,
-                    text_content: String::new(),
-                });
-            }
-
-            markdown.push_str("|");
-            for cell in &rows[0] {
-                markdown.push_str(&format!(" {} |", cell));
-            }
-            markdown.push_str("\n|");
-
-            for _ in &rows[0] {
-                markdown.push_str(" --- |");
-            }
-            markdown.push_str("\n");
-
-            for row in rows.iter().skip(1) {
-                markdown.push_str("|");
-                for cell in row {
-                    markdown.push_str(&format!(" {} |", cell));
-                }
-                markdown.push_str("\n");
-            }
-        }
 
         Ok(DocumentConverterResult {
             title: None,
-            text_content: markdown,
+            text_content: render_worksheet(&mut workbook),
         })
     }
 }

@@ -349,31 +349,13 @@ impl DocumentProcessor {
             return self.process_pptx_with_vlm(input);
         }
 
-        // Check for encrypted PDFs before passing to markitdown to avoid panics
-        if is_pdf_extension(&extension) {
-            match is_pdf_encrypted(input) {
-                Ok(true) => {
-                    // Encrypted PDF - try OCR if available, otherwise return error
-                    if self.ocr_enabled
-                        && let Ok(ocr_result) = self.process_with_ocr(input)
-                        && !ocr_result.text_content.trim().is_empty()
-                    {
-                        return Ok(ocr_result);
-                    }
-                    bail!(
-                        "PDF is encrypted/password-protected and cannot be converted. \
-                        Consider using --vlm flag to process it via a vision model, \
-                        or --ocr flag to extract text via OCR."
-                    );
-                }
-                Ok(false) => {} // Not encrypted, proceed with markitdown
-                Err(e) => {
-                    warn!(
-                        "Could not check PDF encryption status: {e}, attempting conversion anyway"
-                    );
-                }
-            }
-        }
+        // Determine encryption status (but do NOT pre-emptively deny: many
+        // corporate PDFs use an empty user password, i.e. they are encrypted
+        // to restrict editing, not reading, and the normal pipeline reads them
+        // fine). Only if conversion below yields no text do we fall back to
+        // OCR/VLM or surface a denial. Track the flag to decide that fallback.
+        let encrypted_pdf = is_pdf_extension(&extension)
+            && matches!(is_pdf_encrypted(input), Ok(true));
 
         // PDF + office path: use LiteParse as the Tier-0 parser. For PDFs it
         // extracts native text for text/vector pages and OCRs only scanned/
@@ -434,6 +416,28 @@ impl DocumentProcessor {
                 Err(e) => warn!("OCR failed on {}: {e:#}", input.display()),
                 Ok(_) => {}
             }
+        }
+
+        // Encrypted PDF that the normal path could not read. Try OCR if
+        // available; if not (or empty), surface clear guidance rather than a
+        // bare "no converter" error. This only runs once the pipeline above
+        // already tried liteparse + markitdown and got nothing.
+        if encrypted_pdf {
+            if self.ocr_enabled
+                && let Ok(ocr_result) = self.process_with_ocr(input)
+                && !ocr_result.text_content.trim().is_empty()
+            {
+                warn!(
+                    "encrypted PDF {} yielded no text via native path; recovered via OCR",
+                    input.display()
+                );
+                return Ok(ocr_result);
+            }
+            bail!(
+                "PDF is encrypted/password-protected and could not be read by the native \
+                parser. It may use a non-empty user password. Try: --vlm to process it \
+                via a vision model, or --ocr to extract text via OCR."
+            );
         }
 
         // Fallback: try reading as text
