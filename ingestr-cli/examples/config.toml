@@ -63,6 +63,12 @@ page_dpi = 300
 # is delegated to this server instead of liteparse's built-in Tesseract.
 # ocr_server_url = "http://localhost:8000"
 
+[processors.pdf]
+# Shell command printing passwords for encrypted PDFs, one per line. Runs
+# only when a PDF needs a password, after --password / --password-file /
+# INGESTR_PDF_PASSWORDS. Example with kyz:
+# password_command = "kyz get --service ingestr pdf-passwords"
+
 [processors.layout]
 # Layout analysis (ADR-0005): crop charts, diagrams and pictures from PDF
 # pages that have vector figures or are scanned, and link the PNGs in the

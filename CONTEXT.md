@@ -169,6 +169,13 @@ little text), cropping charts / diagrams / pictures to `fig_pN_K.png` and
 linking them above their captions (`--layout`, ADR-0005).
 _Avoid_: layout parsing (LiteParse's reading-order pass is separate)
 
+**Locked PDF**:
+A PDF that needs a password to open (a user password). ingestr opens it with
+the first working candidate password and refuses it otherwise. PDFs that are
+encrypted only to restrict printing or copying are not locked and convert as
+they are.
+_Avoid_: encrypted PDF (most encrypted PDFs are not locked)
+
 **Resume Cache**:
 The content-hash conversion Cache as used by batch conversion: a re-run skips
 files whose content and conversion flags were already converted (`skipped` in

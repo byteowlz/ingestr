@@ -43,7 +43,6 @@ sha2 = "0.10"
 hex = "0.4"
 regex = "1"
 arboard = "3"
-lopdf = "0.35"
 ocrs = "0.12.1"
 rten = "0.24.0"
 # `oar-ocr` enables the native ONNX PP-OCR engine (PaddleOCR family) as the

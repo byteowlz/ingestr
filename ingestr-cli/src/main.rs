@@ -24,6 +24,7 @@ use ingestr_core::cache::{CACHE_SCHEMA, cache_dir, cache_get, cache_put};
 use ingestr_core::fetch::{fetch_url, is_url};
 use ingestr_core::formats::{SUPPORTED_EXTENSIONS, is_hidden_component};
 use ingestr_core::markdown::*;
+use ingestr_core::pdf_password::{PASSWORDS_ENV, parse_password_list};
 use ingestr_core::pipeline::*;
 use ingestr_core::settings::*;
 use log::{LevelFilter, debug, error, info, warn};
@@ -299,6 +300,17 @@ struct ConvertCommand {
     /// and link them in the Markdown (needs -o; ~1 s per figure/scanned page)
     #[arg(long)]
     layout: bool,
+    /// Password for encrypted PDFs; repeatable, tried in order. Visible in
+    /// the process list: prefer --password-file or INGESTR_PDF_PASSWORDS
+    #[arg(long = "password", value_name = "PASSWORD")]
+    passwords: Vec<Secret>,
+    /// File with PDF passwords, one per line; repeatable. '-' reads stdin
+    /// (e.g. `kyz pipe pdf/passwords ingestr convert x.pdf --password-file -`)
+    #[arg(long = "password-file", value_name = "PATH")]
+    password_files: Vec<PathBuf>,
+    /// Resolved candidate passwords (flags, files, INGESTR_PDF_PASSWORDS).
+    #[arg(skip)]
+    pdf_passwords: Vec<Secret>,
     /// Include YAML frontmatter with metadata in output
     #[arg(long)]
     meta: bool,
@@ -1038,7 +1050,53 @@ struct ConvertStats {
     errors: Vec<String>,
 }
 
-fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
+/// A password from the command line; `Debug` never shows it.
+#[derive(Clone)]
+struct Secret(String);
+
+impl std::str::FromStr for Secret {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Candidate PDF passwords in order: `--password`, `--password-file`, then
+/// the `INGESTR_PDF_PASSWORDS` environment variable.
+fn resolve_pdf_passwords(cmd: &ConvertCommand, input_is_stdin: bool) -> Result<Vec<Secret>> {
+    let mut out = cmd.passwords.clone();
+    for file in &cmd.password_files {
+        let text = if file.as_os_str() == "-" {
+            if input_is_stdin {
+                bail!("--password-file - needs stdin, but stdin is already the input document");
+            }
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading passwords from stdin")?;
+            buf
+        } else {
+            fs::read_to_string(file)
+                .with_context(|| format!("reading password file {}", file.display()))?
+        };
+        out.extend(parse_password_list(&text).into_iter().map(Secret));
+    }
+    if let Ok(text) = env::var(PASSWORDS_ENV) {
+        out.extend(parse_password_list(&text).into_iter().map(Secret));
+    }
+    Ok(out)
+}
+
+fn handle_convert(ctx: &RuntimeContext, mut cmd: ConvertCommand) -> Result<()> {
+    let is_stdin =
+        !cmd.clipboard && (cmd.input.is_none() || cmd.input.as_ref().is_some_and(|s| s == "-"));
+    cmd.pdf_passwords = resolve_pdf_passwords(&cmd, is_stdin)?;
     let settings = ctx.service_settings(&ServiceRunOpts {
         watch_dir: None,
         output_dir: None,
@@ -1052,9 +1110,6 @@ fn handle_convert(ctx: &RuntimeContext, cmd: ConvertCommand) -> Result<()> {
         let _ = fs::remove_file(&temp_path);
         return result;
     }
-
-    // Check if reading from stdin
-    let is_stdin = cmd.input.is_none() || cmd.input.as_ref().is_some_and(|s| s == "-");
 
     if is_stdin {
         return handle_convert_stdin(ctx, &cmd, &settings);
@@ -1136,6 +1191,7 @@ fn convert_single_input(
         )
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
         .with_layout(cmd.layout)
+        .with_pdf_passwords(cmd.pdf_passwords.iter().map(|s| s.0.clone()).collect())
         .with_image_output_dir(image_target_dir(cmd.output.as_deref()))
         .with_engine(cmd.engine);
 
@@ -1730,6 +1786,7 @@ fn process_file_for_batch(
         )
         .with_ocr(cmd.ocr, cmd.ocr_backend, cmd.ocr_languages.clone())
         .with_layout(cmd.layout)
+        .with_pdf_passwords(cmd.pdf_passwords.iter().map(|s| s.0.clone()).collect())
         .with_image_output_dir(batch_image_dir(output_dir))
         .with_engine(cmd.engine);
 

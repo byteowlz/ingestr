@@ -130,6 +130,8 @@ pub struct ProcessorsConfig {
     pub ocr: OcrConfig,
     /// Layout analysis (figure crops) configuration
     pub layout: LayoutConfig,
+    /// PDF options (passwords for encrypted PDFs)
+    pub pdf: PdfConfig,
 }
 
 impl Default for ProcessorsConfig {
@@ -140,8 +142,19 @@ impl Default for ProcessorsConfig {
             vlm: VlmConfig::default(),
             ocr: OcrConfig::default(),
             layout: LayoutConfig::default(),
+            pdf: PdfConfig::default(),
         }
     }
+}
+
+/// `[processors.pdf]`: options for PDF input.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PdfConfig {
+    /// Shell command printing passwords for encrypted PDFs, one per line
+    /// (e.g. `kyz get pdf-passwords`). Runs only when a PDF needs a password,
+    /// after any passwords given on the command line.
+    pub password_command: Option<String>,
 }
 
 /// VLM (Vision Language Model) processor configuration.

@@ -39,7 +39,6 @@ sha2.workspace = true
 hex.workspace = true
 regex.workspace = true
 arboard.workspace = true
-lopdf.workspace = true
 ocrs.workspace = true
 rten.workspace = true
 liteparse.workspace = true
