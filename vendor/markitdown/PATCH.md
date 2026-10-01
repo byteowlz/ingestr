@@ -39,3 +39,13 @@ PY
 
 Then verify `rg -n 'println!' src --glob '!main.rs'` prints nothing, and
 consider dropping this patch once the fix is upstream.
+## Spreadsheets: .xls/.ods and every sheet (ingestr-6vsx)
+
+- `src/excel.rs`: open with calamine `open_workbook_auto` (xlsx, xlsm, xlsb,
+  xls, ods) instead of `Xlsx` only, render every non-empty sheet under a
+  `## <sheet>` heading (no heading for single-sheet workbooks), and escape `|`
+  in cells.
+- `src/lib.rs` `detect_file_type`: when content sniffing reports a legacy OLE
+  type (`msi`/`doc`/`xls`/`ppt`) and the file name has one of those
+  extensions, use the name. `infer` reports `msi` for .xls files without a
+  class ID.
