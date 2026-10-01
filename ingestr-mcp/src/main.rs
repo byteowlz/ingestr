@@ -52,9 +52,10 @@ struct Cli {
 struct ConvertDocumentArgs {
     /// Absolute path of the document, or an http(s) URL.
     path: String,
-    /// Run OCR on scanned pages and images (slower; default false).
+    /// OCR. Default (unset): pages without usable text are OCR'd
+    /// automatically. `true`: thorough, also text inside pictures. `false`: off.
     #[serde(default)]
-    ocr: bool,
+    ocr: Option<bool>,
     /// Return the raw conversion without Markdown cleanup (default false).
     #[serde(default)]
     raw: bool,
@@ -77,9 +78,10 @@ struct ConvertToFileArgs {
     path: String,
     /// Output Markdown file path. Extracted images are written next to it.
     output: String,
-    /// Run OCR on scanned pages and images (slower; default false).
+    /// OCR. Default (unset): pages without usable text are OCR'd
+    /// automatically. `true`: thorough, also text inside pictures. `false`: off.
     #[serde(default)]
-    ocr: bool,
+    ocr: Option<bool>,
     /// Write the raw conversion without Markdown cleanup (default false).
     #[serde(default)]
     raw: bool,
@@ -112,7 +114,7 @@ impl IngestrMcp {
     }
 
     #[tool(
-        description = "Convert a document (PDF, Office, HTML, images, ...) or an http(s) URL to Markdown and return it. Use `ocr: true` for scanned pages; use `max_chars` or `section` to keep the result small."
+        description = "Convert a document (PDF, Office, HTML, images, ...) or an http(s) URL to Markdown and return it. Scanned pages are OCRed automatically (`ocr: false` turns that off). Use `max_chars` or `section` to keep the result small."
     )]
     async fn convert_document(
         &self,
@@ -127,8 +129,10 @@ impl IngestrMcp {
             "--json".into(),
             "--quiet".into(),
         ];
-        if args.ocr {
-            cli_args.push("--ocr".into());
+        match args.ocr {
+            Some(true) => cli_args.push("--ocr".into()),
+            Some(false) => cli_args.push("--no-ocr".into()),
+            None => {}
         }
         if args.raw {
             cli_args.push("--raw".into());
@@ -185,8 +189,10 @@ impl IngestrMcp {
             args.output.clone(),
             "--quiet".into(),
         ];
-        if args.ocr {
-            cli_args.push("--ocr".into());
+        match args.ocr {
+            Some(true) => cli_args.push("--ocr".into()),
+            Some(false) => cli_args.push("--no-ocr".into()),
+            None => {}
         }
         if args.raw {
             cli_args.push("--raw".into());

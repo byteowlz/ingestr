@@ -50,6 +50,7 @@ test:
 # Install binaries locally
 install-cli:
     cargo install --locked --path ingestr-cli
+    ingestr doctor --fetch
 
 install-mcp:
     cargo install --locked --path ingestr-mcp
@@ -57,3 +58,4 @@ install-mcp:
 install-all:
     cargo install --locked --path ingestr-cli
     cargo install --locked --path ingestr-mcp
+    ingestr doctor --fetch

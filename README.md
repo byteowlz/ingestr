@@ -9,7 +9,7 @@ output belongs to whatever you already use for that (see ADR-0003).
 ## Features
 
 - **Document conversion**: PDF, DOCX, PPTX, XLSX, HTML, CSV, images and more to Markdown. PDFs and presentations/documents (PPTX/DOCX) use [LiteParse](https://github.com/run-llama/liteparse) (fast native extraction, page-aware OCR merge, embedded-image extraction); spreadsheets and other formats use [markitdown](https://crates.io/crates/markitdown).
-- **OCR for scanned pages and images**: PP-OCR (PaddleOCR family) via a bundled ONNX runtime by default, CPU-only; models download on first use. Tesseract and other backends are available. OCR only runs on pages that need it.
+- **OCR for scanned pages and images, on by default**: PP-OCR (PaddleOCR family) via a bundled ONNX runtime, CPU-only. Only pages without usable text are OCR'd; text pages keep their native text and speed. Sideways scans are turned upright, and figures on scans are cropped to PNGs. Tesseract and other backends are available.
 - **Batch conversion that scales**: resumable by content hash, a document-format allowlist, per-file failure isolation, parallel workers, `--dry-run` and machine-readable `--json` output.
 - **Watch service**: converts documents as they land in a directory.
 - **MCP server**: exposes conversion to AI assistants over the Model Context Protocol (official `rmcp` SDK).
@@ -28,11 +28,14 @@ cargo install --path ingestr-cli
 cargo install --path ingestr-mcp
 ```
 
-Or use just:
+Or use just, which also downloads the OCR and layout models (~160 MB, from
+Hugging Face) so the first scan does not wait for them:
 
 ```bash
 just install-all
 ```
+
+Without just, run `ingestr doctor --fetch` once after installing.
 
 ## Quick Start
 
@@ -67,7 +70,7 @@ Commands:
   config       Inspect and manage configuration
   cache        Inspect or clear the conversion cache
   completions  Generate shell completions
-  doctor       Report which external tools are installed
+  doctor       Report which external tools and models are installed (doctor)
 ```
 
 ### External dependencies
@@ -104,12 +107,18 @@ Batch runs are resumable: converted files are cached by content hash, so
 re-running after an interruption only converts what is new or changed (and
 re-creates missing outputs from the cache). By default only known document
 formats are attempted; use `--extensions pdf,docx` to narrow, `--all-files` to
-try everything, and `--engine liteparse|markitdown` to force an engine. Add
-`--ocr` for scanned documents; it only OCRs pages that actually need it.
-Add `--layout` (with `-o`) to crop charts and diagrams that are drawn as vector
-graphics or sit inside scans into `fig_pN_K.png` files linked from the
-Markdown; it runs a layout model (~125 MB, ~1 s per selected page on CPU) only
-on pages that can hold such figures.
+try everything, and `--engine liteparse|markitdown` to force an engine.
+
+OCR runs automatically, page by page, on pages without usable text (scans,
+blank or garbled pages); pages with a text layer keep it. `--ocr` is the
+thorough mode: it also reads text inside pictures (logos, pasted screenshots)
+and OCRs the whole document. `--no-ocr` turns OCR off. A document that still
+comes back nearly empty gets a warning with the likely fix.
+
+With an output path (`-o`), charts and pictures on scanned pages are cropped
+into `img_pN_K.png` files linked from the Markdown (layout model, ~125 MB,
+~1 s per scanned page). `--layout` does this on every page with a figure,
+including vector charts in text PDFs; `--no-layout` turns it off.
 
 PDFs that only restrict printing or copying convert as they are. For PDFs
 that need a password to open, ingestr tries candidates in order:
@@ -188,6 +197,9 @@ Configuration is loaded from (in order of increasing priority):
 3. Local config: `./config.toml`
 4. Environment variables: `INGESTR_CLI__<SECTION>__<KEY>`
 5. CLI-specified config: `--config <path>`
+
+`ingestr init` writes every setting commented out, so a newer ingestr can
+improve the defaults; only lines you uncomment are pinned.
 6. Command-line arguments
 
 ### Example config.toml
@@ -217,7 +229,7 @@ markdown_dir = "~/markdown"
 # state_dir = "$XDG_STATE_HOME/ingestr"
 
 [processors.ocr]
-enabled = false
+enabled = true            # auto OCR: only pages without usable text
 backend = "paddle"        # paddle (default) | tesseract | ocrs | surya | easyocr
 paddle_model = "small"    # tiny | small | medium
 languages = ["eng"]
@@ -308,7 +320,7 @@ ingestr-mcp --show-config
 | `convert_document` | Convert a file or http(s) URL to Markdown and return it; options `ocr`, `raw`, `max_chars`, `pages`, `section` |
 | `convert_to_file` | Convert and write Markdown (plus extracted images) to an output path |
 | `supported_formats` | List the file extensions ingestr can convert |
-| `doctor` | Report which optional external tools are installed |
+| `doctor` | Report which optional external tools and models are installed |
 
 ### MCP Server Options
 

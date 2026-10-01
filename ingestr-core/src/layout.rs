@@ -241,10 +241,17 @@ pub(crate) fn add_figures(
     cfg: &LayoutConfig,
     orientation: &[liteparse::config::PageOrientationCorrection],
     password: Option<&str>,
+    scans_only: bool,
 ) -> Result<usize> {
     let selected: Vec<u32> = pages
         .iter()
         .filter(|p| {
+            if scans_only {
+                return p
+                    .complexity
+                    .as_ref()
+                    .is_some_and(|c| c.full_page_image && page_ocr(c, false) == PageOcr::Yes);
+            }
             let coverage: Vec<f32> = p
                 .figures
                 .iter()

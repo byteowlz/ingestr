@@ -52,6 +52,11 @@ pub const fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// A Markdown code fence line (```` ``` ```` or ```` ```lang ````).
+fn is_fence(trimmed: &str) -> bool {
+    trimmed.starts_with("```")
+}
+
 /// Clean converted markdown by removing common PDF/document noise.
 pub fn clean_markdown(text: &str) -> String {
     let mut lines: Vec<&str> = text.lines().collect();
@@ -62,7 +67,7 @@ pub fn clean_markdown(text: &str) -> String {
         let mut freq: HashMap<String, usize> = HashMap::new();
         for line in &lines {
             let trimmed = line.trim();
-            if !trimmed.is_empty() && trimmed.len() < 120 {
+            if !trimmed.is_empty() && trimmed.len() < 120 && !is_fence(trimmed) {
                 *freq.entry(trimmed.to_lowercase()).or_insert(0) += 1;
             }
         }
@@ -84,6 +89,17 @@ pub fn clean_markdown(text: &str) -> String {
     // 2. Remove standalone page numbers (lines that are just a number, optionally with "Page" prefix)
     lines.retain(|line| !PAGE_NUM_RE.is_match(line));
 
+    // Fence lines and everything between them are code: never joined.
+    let mut in_code = Vec::with_capacity(lines.len());
+    let mut open = false;
+    for line in &lines {
+        let fence = is_fence(line.trim());
+        in_code.push(open || fence);
+        if fence {
+            open = !open;
+        }
+    }
+
     // 3. Fix broken line wraps from PDF column layouts:
     // If a line ends without punctuation or a heading marker and the next starts lowercase, join them.
     let mut result = String::with_capacity(text.len());
@@ -96,7 +112,9 @@ pub fn clean_markdown(text: &str) -> String {
 
             // Join if: current doesn't end with sentence-ender or heading,
             // current is not empty, next starts with lowercase
-            let should_join = !current_trimmed.is_empty()
+            let should_join = !in_code[i]
+                && !in_code[i + 1]
+                && !current_trimmed.is_empty()
                 && !next.is_empty()
                 && !current_trimmed.ends_with('.')
                 && !current_trimmed.ends_with(':')

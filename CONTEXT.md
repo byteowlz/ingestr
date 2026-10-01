@@ -169,6 +169,13 @@ little text), cropping charts / diagrams / pictures to `fig_pN_K.png` and
 linking them above their captions (`--layout`, ADR-0005).
 _Avoid_: layout parsing (LiteParse's reading-order pass is separate)
 
+**Auto OCR**:
+The default: OCR runs only on pages without usable text (scans, blank or
+garbled pages), and only those pages are OCR'd; the others keep their native
+text. Thorough OCR (`--ocr`) also reads text inside pictures and OCRs the
+whole document.
+_Avoid_: forced OCR, OCR fallback
+
 **Locked PDF**:
 A PDF that needs a password to open (a user password). ingestr opens it with
 the first working candidate password and refuses it otherwise. PDFs that are
