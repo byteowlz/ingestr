@@ -80,6 +80,23 @@ impl MarkItDown {
     }
 
     pub fn detect_file_type(&self, file_path: &str) -> Option<String> {
+        // Prefer the real file extension for document/binary formats. Content
+        // sniffing (infer) mislabels legacy OLE2 .xls files as `.cfb`, and
+        // office/doc formats generally; the path extension is authoritative
+        // for these. Fall back to infer only when the extension is unknown.
+        if let Some(ext) = Path::new(file_path).extension() {
+            if let Some(ext_str) = ext.to_str() {
+                let lower = ext_str.to_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "xls" | "xlsx" | "xlsm" | "xlsb" | "doc" | "docx" | "ppt"
+                        | "pptx" | "odt" | "ods" | "odp" | "pdf"
+                ) {
+                    return Some(format!(".{}", lower));
+                }
+            }
+        }
+
         if let Some(kind) = infer::get_from_path(file_path).ok().flatten() {
             return Some(format!(".{}", kind.extension()));
         }
