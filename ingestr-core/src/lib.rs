@@ -15,6 +15,7 @@ pub mod models;
 mod ocr_gate;
 pub mod ocr_pool;
 mod orientation;
+pub mod pdf_password;
 pub mod pipeline;
 pub mod settings;
 

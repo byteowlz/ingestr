@@ -240,6 +240,7 @@ pub(crate) fn add_figures(
     image_dir: &Path,
     cfg: &LayoutConfig,
     orientation: &[liteparse::config::PageOrientationCorrection],
+    password: Option<&str>,
 ) -> Result<usize> {
     let selected: Vec<u32> = pages
         .iter()
@@ -267,6 +268,7 @@ pub(crate) fn add_figures(
     let renderer = LiteParse::new(LiteParseConfig {
         dpi: dpi as f32,
         page_orientation_corrections: orientation.to_vec(),
+        password: password.map(str::to_string),
         ..Default::default()
     });
     let path = input

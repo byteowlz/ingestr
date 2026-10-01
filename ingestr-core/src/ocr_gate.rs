@@ -151,6 +151,7 @@ fn images_have_text(
     pages: &HashSet<usize>,
     page_area: f32,
     ocr: &OcrConfig,
+    password: Option<&str>,
 ) -> Result<bool> {
     let det = detector(PpOcrTier::parse(&ocr.paddle_model))?;
     let dir = tempfile::tempdir()?;
@@ -159,6 +160,7 @@ fn images_have_text(
         quiet: true,
         extract_images: true,
         image_output_dir: Some(dir.path().to_string_lossy().into_owned()),
+        password: password.map(str::to_string),
         ..Default::default()
     });
     let parsed = liteparse_runtime()?.block_on(parser.parse(path))?;
@@ -203,7 +205,7 @@ impl OcrPlan {
 
 /// Whether a PDF needs OCR, and which of its pages are full-page scans. Any
 /// failure means "needed", so OCR is never skipped by mistake.
-pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig) -> OcrPlan {
+pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig, password: Option<&str>) -> OcrPlan {
     let Some(path_str) = path.to_str() else {
         return OcrPlan::needed();
     };
@@ -213,6 +215,7 @@ pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig) -> OcrPlan {
     let probe = LiteParse::new(LiteParseConfig {
         ocr_enabled: false,
         quiet: true,
+        password: password.map(str::to_string),
         ..Default::default()
     });
     let input = liteparse::types::PdfInput::Path(path_str.to_string());
@@ -257,7 +260,7 @@ pub(crate) fn pdf_ocr_plan(path: &Path, ocr: &OcrConfig) -> OcrPlan {
         );
         return plan;
     }
-    match images_have_text(path_str, &image_pages, page_area, ocr) {
+    match images_have_text(path_str, &image_pages, page_area, ocr, password) {
         Ok(true) => OcrPlan::needed(),
         Ok(false) => {
             debug!(

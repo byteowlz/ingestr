@@ -111,6 +111,18 @@ graphics or sit inside scans into `fig_pN_K.png` files linked from the
 Markdown; it runs a layout model (~125 MB, ~1 s per selected page on CPU) only
 on pages that can hold such figures.
 
+PDFs that only restrict printing or copying convert as they are. For PDFs
+that need a password to open, ingestr tries candidates in order:
+`--password` (repeatable; visible in the process list), `--password-file`
+(one per line, `-` for stdin), `INGESTR_PDF_PASSWORDS` (one per line), then
+the lines printed by `[processors.pdf] password_command`, which only runs when
+a PDF needs it. With kyz:
+
+```bash
+kyz pipe ingestr/pdf-passwords ingestr convert locked.pdf --password-file -
+# or in config.toml: password_command = "kyz get --service ingestr pdf-passwords"
+```
+
 ### Service Commands
 
 ```bash

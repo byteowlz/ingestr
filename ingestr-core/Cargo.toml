@@ -23,8 +23,8 @@ hex.workspace = true
 hf-hub.workspace = true
 image.workspace = true
 liteparse.workspace = true
+pdfium = { package = "liteparse-pdfium", version = "1.11" }
 log.workspace = true
-lopdf.workspace = true
 markitdown.workspace = true
 oar-ocr.workspace = true
 tempfile.workspace = true

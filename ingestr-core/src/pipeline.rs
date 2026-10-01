@@ -28,6 +28,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::runtime::Runtime;
 
 use crate::formats::{extension_of, is_liteparse_extension, is_office_extension};
+use crate::pdf_password::PdfPasswords;
 use crate::settings::*;
 
 /// The result of converting one document.
@@ -116,6 +117,8 @@ pub struct DocumentProcessor {
     pub(crate) layout_enabled: bool,
     /// Receives the fast stage-1 document before a slow stage 2 runs.
     pub(crate) preview: Option<PreviewFn>,
+    /// Candidate passwords for encrypted PDFs.
+    pub(crate) pdf_passwords: PdfPasswords,
 }
 
 /// Callback receiving the fast stage-1 document (ADR-0005).
@@ -152,6 +155,8 @@ impl fmt::Debug for DocumentProcessor {
 impl DocumentProcessor {
     /// Create a processor with defaults (no VLM, no OCR, `auto` engine).
     pub fn new(settings: ProcessorSettings) -> Self {
+        let pdf_passwords =
+            PdfPasswords::new(Vec::new(), settings.processors.pdf.password_command.clone());
         Self {
             markitdown: MarkItDown::new(),
             settings,
@@ -168,7 +173,19 @@ impl DocumentProcessor {
             engine: ConvertEngine::Auto,
             layout_enabled: false,
             preview: None,
+            pdf_passwords,
         }
+    }
+
+    /// Passwords to try, in order, on PDFs that need one; tried before the
+    /// configured `[processors.pdf] password_command`.
+    #[must_use]
+    pub fn with_pdf_passwords(mut self, passwords: Vec<String>) -> Self {
+        self.pdf_passwords = PdfPasswords::new(
+            passwords,
+            self.settings.processors.pdf.password_command.clone(),
+        );
+        self
     }
 
     /// Enable VLM conversion (`enabled` or config), with optional model/prompt
@@ -270,6 +287,7 @@ impl DocumentProcessor {
         &self,
         input: &Path,
         extension: &str,
+        pdf_password: Option<&str>,
     ) -> Option<Result<ConvertedDocument>> {
         let cfg = &self.settings.routing;
         if cfg.mode == RoutingMode::Heuristic {
@@ -310,7 +328,7 @@ impl DocumentProcessor {
                 return Some(self.process_with_vlm(input, extension));
             }
             if is_pdf_extension(extension) {
-                return Some(self.process_pdf_with_vlm(input));
+                return Some(self.process_pdf_with_vlm(input, pdf_password));
             }
             if is_presentation_extension(extension) {
                 return Some(self.process_pptx_with_vlm(input));
@@ -330,11 +348,21 @@ impl DocumentProcessor {
             .map(str::to_lowercase)
             .unwrap_or_default();
 
+        // Encrypted PDFs: restriction-only ones open as they are; a locked
+        // one needs a password from the candidate list, or fails here with a
+        // clear error.
+        let pdf_password = if is_pdf_extension(&extension) {
+            crate::pdf_password::unlock(input, &self.pdf_passwords)?
+        } else {
+            None
+        };
+        let pdf_password = pdf_password.as_deref();
+
         // Semantic tier-router seam (`[routing]`). In `heuristic` (default)
         // mode this is a strict no-op so existing behavior is unchanged. In
         // `shadow` mode it logs the router decision; in `route` mode it may
         // redirect to the VLM path. See `route_input`.
-        if let Some(result) = self.route_input(input, &extension) {
+        if let Some(result) = self.route_input(input, &extension, pdf_password) {
             return result;
         }
 
@@ -343,19 +371,11 @@ impl DocumentProcessor {
             return self.process_with_vlm(input, &extension);
         }
         if self.vlm_enabled && is_pdf_extension(&extension) {
-            return self.process_pdf_with_vlm(input);
+            return self.process_pdf_with_vlm(input, pdf_password);
         }
         if self.vlm_enabled && is_presentation_extension(&extension) {
             return self.process_pptx_with_vlm(input);
         }
-
-        // Determine encryption status (but do NOT pre-emptively deny: many
-        // corporate PDFs use an empty user password, i.e. they are encrypted
-        // to restrict editing, not reading, and the normal pipeline reads them
-        // fine). Only if conversion below yields no text do we fall back to
-        // OCR/VLM or surface a denial. Track the flag to decide that fallback.
-        let encrypted_pdf = is_pdf_extension(&extension)
-            && matches!(is_pdf_encrypted(input), Ok(true));
 
         // PDF + office path: use LiteParse as the Tier-0 parser. For PDFs it
         // extracts native text for text/vector pages and OCRs only scanned/
@@ -364,7 +384,7 @@ impl DocumentProcessor {
         // per-section text plus embedded images. This replaces markitdown for
         // these formats (markitdown's PPTX path is broken).
         if self.engine != ConvertEngine::Markitdown && is_liteparse_extension(&extension) {
-            match self.process_pdf_with_liteparse(input) {
+            match self.process_pdf_with_liteparse(input, pdf_password) {
                 Ok(parsed) if !parsed.text_content.trim().is_empty() => return Ok(parsed),
                 Ok(_) if self.engine == ConvertEngine::Liteparse => {
                     bail!("liteparse produced no text for {}", input.display());
@@ -416,28 +436,6 @@ impl DocumentProcessor {
                 Err(e) => warn!("OCR failed on {}: {e:#}", input.display()),
                 Ok(_) => {}
             }
-        }
-
-        // Encrypted PDF that the normal path could not read. Try OCR if
-        // available; if not (or empty), surface clear guidance rather than a
-        // bare "no converter" error. This only runs once the pipeline above
-        // already tried liteparse + markitdown and got nothing.
-        if encrypted_pdf {
-            if self.ocr_enabled
-                && let Ok(ocr_result) = self.process_with_ocr(input)
-                && !ocr_result.text_content.trim().is_empty()
-            {
-                warn!(
-                    "encrypted PDF {} yielded no text via native path; recovered via OCR",
-                    input.display()
-                );
-                return Ok(ocr_result);
-            }
-            bail!(
-                "PDF is encrypted/password-protected and could not be read by the native \
-                parser. It may use a non-empty user password. Try: --vlm to process it \
-                via a vision model, or --ocr to extract text via OCR."
-            );
         }
 
         // Fallback: try reading as text
@@ -579,7 +577,11 @@ impl DocumentProcessor {
     /// xlsx/…) it converts via LibreOffice and extracts per-slide/per-section
     /// text plus embedded images. It replaces both the markitdown native path
     /// and the hand-rolled page routing.
-    pub(crate) fn process_pdf_with_liteparse(&self, input: &Path) -> Result<ConvertedDocument> {
+    pub(crate) fn process_pdf_with_liteparse(
+        &self,
+        input: &Path,
+        pdf_password: Option<&str>,
+    ) -> Result<ConvertedDocument> {
         // Office formats are converted via LibreOffice; make a missing install
         // a clear, actionable error instead of a cryptic failure.
         if is_office_extension(&extension_of(input)) && !has_libreoffice() {
@@ -613,7 +615,7 @@ impl DocumentProcessor {
         let ext = extension_of(input);
         let wants_ocr = self.ocr_enabled && !is_office_extension(&ext);
         let plan = if wants_ocr && ext == "pdf" {
-            crate::ocr_gate::pdf_ocr_plan(input, &self.settings.processors.ocr)
+            crate::ocr_gate::pdf_ocr_plan(input, &self.settings.processors.ocr, pdf_password)
         } else {
             crate::ocr_gate::OcrPlan {
                 needed: wants_ocr,
@@ -622,7 +624,7 @@ impl DocumentProcessor {
         };
         let ocr_enabled = plan.needed;
         let orientation = if ocr_enabled {
-            crate::orientation::corrections(input, &plan.scanned_pages)
+            crate::orientation::corrections(input, &plan.scanned_pages, pdf_password)
         } else {
             Vec::new()
         };
@@ -650,6 +652,7 @@ impl DocumentProcessor {
             // output so a PPTX/DOCX comes back as text + image components.
             extract_images: image_dir.is_some(),
             image_output_dir: image_dir,
+            password: pdf_password.map(str::to_string),
             ..Default::default()
         };
         let title = input
@@ -728,6 +731,7 @@ impl DocumentProcessor {
                 dir,
                 layout_cfg,
                 &orientation,
+                pdf_password,
             ) {
                 Ok(0) => {}
                 Ok(n) => {
@@ -750,7 +754,11 @@ impl DocumentProcessor {
     /// Convert a PDF page-by-page using VLM: render each page to an image with
     /// pdftoppm, send each image through the vision model, and concatenate the
     /// descriptions into a single markdown document.
-    pub(crate) fn process_pdf_with_vlm(&self, input: &Path) -> Result<ConvertedDocument> {
+    pub(crate) fn process_pdf_with_vlm(
+        &self,
+        input: &Path,
+        pdf_password: Option<&str>,
+    ) -> Result<ConvertedDocument> {
         let vlm_config = &self.settings.processors.vlm;
         let prompt = self.vlm_prompt.as_ref()
             .or(vlm_config.prompts.get("default"))
@@ -761,16 +769,9 @@ impl DocumentProcessor {
 
         // Render PDF pages to PNG images using pdftoppm
         eprint!("Rendering PDF pages...");
-        let status = ProcCommand::new("pdftoppm")
-            .args(["-png", "-r", "200"])
-            .arg(input)
-            .arg(temp_dir.join("page"))
-            .status()
-            .context("running pdftoppm (is poppler installed?)")?;
-
-        if !status.success() {
+        if let Err(e) = render_pdf_pages(input, pdf_password, 200, &temp_dir) {
             let _ = fs::remove_dir_all(&temp_dir);
-            bail!("pdftoppm failed with status {status}");
+            return Err(e);
         }
 
         // Collect page images sorted by name
@@ -1130,22 +1131,47 @@ pub fn has_libreoffice() -> bool {
     command_exists("soffice") || command_exists("libreoffice")
 }
 
-/// Check if a PDF file is encrypted/password-protected.
-/// Returns true if encrypted, false if not, or an error if the file cannot be read.
-pub(crate) fn is_pdf_encrypted(path: &Path) -> Result<bool> {
-    use lopdf::{Document, Object};
-
-    let doc =
-        Document::load(path).with_context(|| format!("failed to load PDF: {}", path.display()))?;
-
-    // Check the Encrypt dictionary in trailer
-    if let Ok(encrypt) = doc.trailer.get(b"Encrypt")
-        && *encrypt != Object::Null
-    {
-        return Ok(true);
+/// Render every page of a PDF to `dir/page-*.png` at `dpi`, sorted by name.
+/// Uses pdftoppm, or PDFium in-process when the PDF needs a password, so the
+/// password never appears on a command line.
+pub(crate) fn render_pdf_pages(
+    input: &Path,
+    password: Option<&str>,
+    dpi: u32,
+    dir: &Path,
+) -> Result<()> {
+    let Some(password) = password else {
+        let status = ProcCommand::new("pdftoppm")
+            .args(["-png", "-r", &dpi.to_string()])
+            .arg(input)
+            .arg(dir.join("page"))
+            .status()
+            .context("running pdftoppm (is poppler installed?)")?;
+        if !status.success() {
+            bail!("pdftoppm failed with status {status}");
+        }
+        return Ok(());
+    };
+    let path = input
+        .to_str()
+        .ok_or_else(|| anyhow!("invalid path encoding"))?;
+    let renderer = LiteParse::new(LiteParseConfig {
+        dpi: dpi as f32,
+        password: Some(password.to_string()),
+        quiet: true,
+        ..Default::default()
+    });
+    let shots = liteparse_runtime()?
+        .block_on(renderer.screenshot(path, None))
+        .with_context(|| format!("rendering pages of {}", input.display()))?;
+    for shot in shots {
+        let file = dir.join(format!("page-{:05}.png", shot.page_num));
+        image::load_from_memory(&shot.image_bytes)
+            .with_context(|| format!("decoding render of page {}", shot.page_num))?
+            .save(&file)
+            .with_context(|| format!("writing {}", file.display()))?;
     }
-
-    Ok(false)
+    Ok(())
 }
 
 pub(crate) fn base64_encode(data: &[u8]) -> String {

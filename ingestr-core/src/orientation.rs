@@ -55,11 +55,15 @@ pub(crate) fn correction(page: u32, label: &str, score: f32) -> Option<PageOrien
 
 /// Orientation corrections for `pages` (1-based) of the PDF at `path`.
 /// A failure costs the correction, never the conversion.
-pub(crate) fn corrections(path: &Path, pages: &[u32]) -> Vec<PageOrientationCorrection> {
+pub(crate) fn corrections(
+    path: &Path,
+    pages: &[u32],
+    password: Option<&str>,
+) -> Vec<PageOrientationCorrection> {
     if pages.is_empty() {
         return Vec::new();
     }
-    match classify(path, pages) {
+    match classify(path, pages, password) {
         Ok(found) => {
             if !found.is_empty() {
                 info!("orientation: turning pages upright {found:?}");
@@ -73,13 +77,18 @@ pub(crate) fn corrections(path: &Path, pages: &[u32]) -> Vec<PageOrientationCorr
     }
 }
 
-fn classify(path: &Path, pages: &[u32]) -> Result<Vec<PageOrientationCorrection>> {
+fn classify(
+    path: &Path,
+    pages: &[u32],
+    password: Option<&str>,
+) -> Result<Vec<PageOrientationCorrection>> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("invalid path encoding"))?;
     let renderer = LiteParse::new(LiteParseConfig {
         dpi: CLASSIFY_DPI,
         quiet: true,
+        password: password.map(str::to_string),
         ..Default::default()
     });
     let shots = liteparse_runtime()?
