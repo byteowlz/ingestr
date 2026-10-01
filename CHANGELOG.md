@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Legacy `.xls` spreadsheets are now converted** (`ingestr-xls`): the Excel
+  route was hard-wired to calamine's `Xlsx` reader, which cannot open the old
+  OLE2 binary `.xls` (OLE2 compound) format, so `.xls` files failed with "no
+  converter available". Spreadsheets now go through `open_workbook_auto`, which
+  dispatches to calamine's `Xls`/`Xlsx`/`Xlsb` reader by extension, and the
+  worksheet-to-Markdown renderer is shared. Content sniffing in
+  `detect_file_type` also no longer mislabels `.xls` as `.cfb` — for known
+  document/binary formats the real file extension wins.
+- **PDFs with an empty user password are no longer eagerly denied**
+  (`ingestr-encrypt`): the pipeline bailed on any PDF carrying an `Encrypt`
+  dictionary before the native parser ran. Corporate PDFs that are encrypted
+  only to restrict editing (empty user password, e.g. `/Filter /Standard`
+  with RC4) are fully readable and now convert via the native path. Only when
+  the native parser (and OCR, if enabled) yield no text does ingestr fall back
+  to an OCR attempt or a clear `--vlm` hint. Files locked behind a real
+  non-empty password still surface a precise error.
+
 - `just install-*` now installs with `--locked`. Without it, `cargo install` ignored `Cargo.lock` and picked up `ort` 2.0.0-rc.13, whose renamed API broke the build (seen on macOS).
 - **Rotated scans are read upright** (`ingestr-fcb2`): with `--ocr`, a page scanned sideways came out empty and an upside-down page came out as garbage. Full-page scans are now classified for orientation first (PP-LCNet doc orientation, 6.8 MB from Hugging Face, sha256-pinned, a few ms per page) and turned upright before OCR. On a test scan, all four rotations (0/90/180/270) now give the same 206 words; upright documents are unchanged.
 - **OCR gate reads text inside images** (`ingestr-38tn`): with `--ocr`, a PDF page whose embedded images contain text (pasted screenshots, diagrams with labels) is now OCR'd. Previously such pages were skipped as "images alongside text" and that text was lost. ingestr runs only PP-OCR's text-detection model (milliseconds per image) on the page's sizeable images. Photo-only pages no longer trigger OCR. Pages flagged for outlined text or annotation text, and scans carrying a small native stamp, are now OCR'd too. On a 34-page labeled set the gate went from 27 to 32 correct decisions, and every remaining miss only costs time.
