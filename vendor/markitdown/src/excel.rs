@@ -1,60 +1,71 @@
-use calamine::{open_workbook_auto, open_workbook_auto_from_rs, Reader};
-use std::io::Cursor;
+use calamine::{open_workbook_auto, open_workbook_auto_from_rs, Reader, Sheets};
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
 use crate::error::MarkitdownError;
 use crate::model::{ConversionOptions, DocumentConverter, DocumentConverterResult};
 
-/// Render the first worksheet of any calamine `Reader` (Xlsx or legacy Xls)
-/// into a Markdown table, preserving the header row.
-fn render_worksheet<R, RS>(workbook: &mut R) -> String
-where
-    R: Reader<RS>,
-    RS: std::io::Read + std::io::Seek,
-{
-    let mut markdown = String::new();
+pub struct ExcelConverter;
 
-    if let Some(Ok(range)) = workbook.worksheet_range_at(0) {
+const EXTENSIONS: [&str; 5] = [".xlsx", ".xls", ".xlsm", ".xlsb", ".ods"];
+
+fn check_extension(args: &Option<ConversionOptions>) -> Result<(), MarkitdownError> {
+    if let Some(ext) = args.as_ref().and_then(|o| o.file_extension.as_deref()) {
+        if !EXTENSIONS.contains(&ext) {
+            return Err(MarkitdownError::InvalidFile(format!(
+                "Expected a spreadsheet ({}), got {}",
+                EXTENSIONS.join(", "),
+                ext
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Render every non-empty sheet as a Markdown table under a `## <sheet>`
+/// heading (the heading is omitted for single-sheet workbooks).
+fn workbook_to_markdown<RS: Read + Seek>(
+    workbook: &mut Sheets<RS>,
+) -> Result<String, MarkitdownError> {
+    let names = workbook.sheet_names();
+    let multi = names.len() > 1;
+    let mut markdown = String::new();
+    for name in names {
+        let range = workbook
+            .worksheet_range(&name)
+            .map_err(|e| MarkitdownError::ParseError(format!("Failed to read sheet {name}: {e}")))?;
         let rows: Vec<Vec<String>> = range
             .rows()
-            .map(|row| row.iter().map(|cell| cell.to_string()).collect())
+            .map(|row| row.iter().map(|cell| cell.to_string().replace('|', "\\|")).collect())
             .collect();
-
         if rows.is_empty() {
-            return markdown;
+            continue;
         }
-
-        markdown.push_str("|");
+        if !markdown.is_empty() {
+            markdown.push('\n');
+        }
+        if multi {
+            markdown.push_str(&format!("## {name}\n\n"));
+        }
+        markdown.push('|');
         for cell in &rows[0] {
             markdown.push_str(&format!(" {} |", cell));
         }
         markdown.push_str("\n|");
-
         for _ in &rows[0] {
             markdown.push_str(" --- |");
         }
-        markdown.push_str("\n");
-
+        markdown.push('\n');
         for row in rows.iter().skip(1) {
-            markdown.push_str("|");
+            markdown.push('|');
             for cell in row {
                 markdown.push_str(&format!(" {} |", cell));
             }
-            markdown.push_str("\n");
+            markdown.push('\n');
         }
     }
-
-    markdown
+    Ok(markdown)
 }
-
-fn is_excel_ext(ext: Option<&str>) -> bool {
-    matches!(
-        ext,
-        Some(".xlsx") | Some(".xls") | Some(".xlsm") | Some(".xlsb")
-    )
-}
-
-pub struct ExcelConverter;
 
 impl DocumentConverter for ExcelConverter {
     fn convert(
@@ -62,26 +73,14 @@ impl DocumentConverter for ExcelConverter {
         local_path: &str,
         args: Option<ConversionOptions>,
     ) -> Result<DocumentConverterResult, MarkitdownError> {
-        if let Some(opts) = &args {
-            if let Some(ext) = &opts.file_extension {
-                if !is_excel_ext(Some(ext)) {
-                    return Err(MarkitdownError::InvalidFile(
-                        format!("Expected an Excel file, got {}", ext)
-                    ));
-                }
-            }
-        }
-
+        check_extension(&args)?;
         let path = Path::new(local_path);
         log::debug!("Opening file: {:#?}", path);
-        // Auto-detects the workbook format (XlsxOLE2 legacy Xls, xlsx, xlsb) so
-        // old binary .xls files are no longer rejected by the Xlsx-only reader.
         let mut workbook = open_workbook_auto(path)
-            .map_err(|e| MarkitdownError::ParseError(format!("Failed to open Excel file: {}", e)))?;
-
+            .map_err(|e| MarkitdownError::ParseError(format!("Failed to open spreadsheet: {}", e)))?;
         Ok(DocumentConverterResult {
             title: None,
-            text_content: render_worksheet(&mut workbook),
+            text_content: workbook_to_markdown(&mut workbook)?,
         })
     }
 
@@ -90,23 +89,12 @@ impl DocumentConverter for ExcelConverter {
         bytes: &[u8],
         args: Option<ConversionOptions>,
     ) -> Result<DocumentConverterResult, MarkitdownError> {
-        if let Some(opts) = &args {
-            if let Some(ext) = &opts.file_extension {
-                if !is_excel_ext(Some(ext)) {
-                    return Err(MarkitdownError::InvalidFile(
-                        format!("Expected an Excel file, got {}", ext)
-                    ));
-                }
-            }
-        }
-        let reader = Cursor::new(bytes);
-        // Auto-detect the workbook format (xlsx / legacy xls / xlsb) from bytes.
-        let mut workbook = open_workbook_auto_from_rs(reader)
-            .map_err(|e| MarkitdownError::ParseError(format!("Failed to open Excel file: {}", e)))?;
-
+        check_extension(&args)?;
+        let mut workbook = open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))
+            .map_err(|e| MarkitdownError::ParseError(format!("Failed to open spreadsheet: {}", e)))?;
         Ok(DocumentConverterResult {
             title: None,
-            text_content: render_worksheet(&mut workbook),
+            text_content: workbook_to_markdown(&mut workbook)?,
         })
     }
 }
