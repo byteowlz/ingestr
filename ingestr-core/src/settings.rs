@@ -54,6 +54,8 @@ pub enum InputFormat {
     Docx,
     /// Excel (XLSX).
     Xlsx,
+    /// Legacy Excel (XLS).
+    Xls,
     /// PowerPoint (PPTX).
     Pptx,
     /// CSV.
@@ -76,6 +78,7 @@ impl InputFormat {
             Self::Pdf => Some("pdf"),
             Self::Docx => Some("docx"),
             Self::Xlsx => Some("xlsx"),
+            Self::Xls => Some("xls"),
             Self::Pptx => Some("pptx"),
             Self::Csv => Some("csv"),
             Self::Json => Some("json"),
