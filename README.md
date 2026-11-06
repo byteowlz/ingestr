@@ -237,7 +237,6 @@ languages = ["eng"]
 # Semantic tier-router seam (System One / kev). Optional SPIKE: routes each
 # document/page to one of a small closed set of ingestion tiers via a local
 # System-One decision model served over HTTP (`POST /v1/systemone`).
-# See docs/research/2026-ocr-vlm-semantic-router.md.
 [routing]
 mode = "heuristic"  # heuristic (default) | shadow | route
 # router_url = "http://localhost:8009"  # System-One base URL; required for shadow/route
@@ -273,9 +272,7 @@ model = "kev-latest"
 In `shadow`/`route` mode, if the router is unreachable or returns an error, the
 pipeline falls back to the `heuristic` behavior and never panics. Router
 decisions are cached in-process by a content hash (sha256 of the file bytes) so
-repeated/converted documents reuse a decision. See
-`docs/research/2026-ocr-vlm-semantic-router.md` for the research and tier model
-recommendations.
+repeated/converted documents reuse a decision.
 
 ### Environment Variables
 

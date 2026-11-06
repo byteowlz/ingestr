@@ -4,4 +4,5 @@
 
 mod auto_ocr;
 mod encrypted_pdfs;
+mod markitdown_docx;
 mod spreadsheets;

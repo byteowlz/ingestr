@@ -96,6 +96,17 @@ impl MarkItDown {
                     return Some(ext.clone());
                 }
             }
+            // OOXML packages are ZIP containers, and the msooxml heuristic
+            // only recognizes common entry layouts; everything else sniffs
+            // as plain "zip" (ingestr-ayq3). Within the ZIP family, trust
+            // the name so .docx/.xlsx/.pptx reach their dedicated
+            // converters instead of the generic ZIP listing.
+            const OOXML: [&str; 4] = [".zip", ".docx", ".xlsx", ".pptx"];
+            if let Some(ext) = &path_ext {
+                if OOXML.contains(&sniffed.as_str()) && OOXML.contains(&ext.as_str()) {
+                    return Some(ext.clone());
+                }
+            }
             return Some(sniffed);
         }
 
@@ -162,9 +173,29 @@ impl MarkItDown {
 
                     for i in 0..archive.len() {
                         let mut file = archive.by_index(i)?;
+                        // Directory entries (`word/`, `_rels/`) carry no
+                        // content, and extracting them would try to create
+                        // a file at a trailing-slash path (ENOENT).
+                        if file.is_dir() {
+                            continue;
+                        }
                         let file_name = file.name().to_string();
                         let dir = tempdir()?;
-                        let file_path = dir.path().join(&file_name);
+                        // enclosed_name rejects absolute paths and `..`
+                        // traversal, so members stay inside the temp dir.
+                        let member_path = file.enclosed_name().ok_or_else(|| {
+                            MarkitdownError::InvalidFile(format!(
+                                "Unsafe zip member path: {}",
+                                file_name
+                            ))
+                        })?;
+                        let file_path = dir.path().join(&member_path);
+                        // OOXML members live in nested directories
+                        // (`_rels/.rels`, `word/document.xml`); create the
+                        // parents or File::create fails with ENOENT.
+                        if let Some(parent) = file_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
                         let mut temp_file = fs::File::create(&file_path)?;
                         io::copy(&mut file, &mut temp_file)?;
                         for converter in &self.converters {
@@ -209,11 +240,25 @@ impl MarkItDown {
             }
         }
 
+        let mut owner_error: Option<MarkitdownError> = None;
         for converter in &self.converters {
             match converter.convert(source, args.clone()) {
                 Ok(result) => return Ok(Some(result)),
-                Err(_) => continue, // Try next converter
+                Err(err) => {
+                    // Converters reject formats they do not own with
+                    // InvalidFile("Expected .x ... got .y"). Any other error
+                    // means the owning converter tried and failed; keep it
+                    // so a real parser failure is not swallowed as
+                    // "no converter available" (ingestr-ayq3).
+                    if owner_error.is_none() && !is_extension_rejection(&err) {
+                        owner_error = Some(err);
+                    }
+                    continue; // Try next converter
+                }
             }
+        }
+        if let Some(err) = owner_error {
+            return Err(err);
         }
         Ok(None)
     }
@@ -279,12 +324,31 @@ impl MarkItDown {
             }
         }
 
+        let mut owner_error: Option<MarkitdownError> = None;
         for converter in &self.converters {
             match converter.convert_bytes(bytes, args.clone()) {
                 Ok(result) => return Ok(Some(result)),
-                Err(_) => continue, // Try next converter
+                Err(err) => {
+                    if owner_error.is_none() && !is_extension_rejection(&err) {
+                        owner_error = Some(err);
+                    }
+                    continue; // Try next converter
+                }
             }
         }
+        if let Some(err) = owner_error {
+            return Err(err);
+        }
         Ok(None)
+    }
+}
+
+/// Converters reject formats they do not own with
+/// `InvalidFile("Expected .x file, got .y")`; any other error is a real
+/// conversion attempt that failed.
+fn is_extension_rejection(err: &MarkitdownError) -> bool {
+    match err {
+        MarkitdownError::InvalidFile(msg) => msg.starts_with("Expected "),
+        _ => false,
     }
 }

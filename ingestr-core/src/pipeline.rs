@@ -52,26 +52,27 @@ pub(crate) fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-/// Run a markitdown conversion, turning errors and panics into `None` (with a
-/// warning) so one bad file never takes down a batch or the watch service.
-pub fn safe_markitdown_convert<T, E, F>(context: &str, convert: F) -> Option<T>
+/// Run a markitdown conversion, turning errors and panics into a warning so
+/// one bad file never takes down a batch or the watch service. The failure
+/// text (error or panic message) is returned so callers can surface an
+/// actionable terminal error instead of a generic fallback diagnosis
+/// (ingestr-ayq3).
+pub fn safe_markitdown_convert<T, E, F>(context: &str, convert: F) -> Result<Option<T>, String>
 where
     F: FnOnce() -> std::result::Result<Option<T>, E>,
     E: fmt::Display,
 {
     match catch_unwind(AssertUnwindSafe(convert)) {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => {
-            warn!("markitdown failed while {context}: {err}");
-            None
+            let failure = err.to_string();
+            warn!("markitdown failed while {context}: {failure}");
+            Err(failure)
         }
         Err(payload) => {
-            warn!(
-                "markitdown panicked while {}: {}",
-                context,
-                panic_payload_to_string(payload)
-            );
-            None
+            let failure = panic_payload_to_string(payload);
+            warn!("markitdown panicked while {}: {}", context, failure);
+            Err(failure)
         }
     }
 }
@@ -501,18 +502,19 @@ impl DocumentProcessor {
             .ok_or_else(|| anyhow!("invalid path encoding"))?;
         let context = format!("converting {}", input.display());
 
-        match safe_markitdown_convert(&context, || {
+        let markitdown_failure = match safe_markitdown_convert(&context, || {
             self.markitdown.convert(path_str, conversion_opts)
         }) {
-            Some(result) if !result.text_content.trim().is_empty() => {
+            Ok(Some(result)) if !result.text_content.trim().is_empty() => {
                 return Ok(ConvertedDocument {
                     title: result.title,
                     text_content: result.text_content,
                     already_written: false,
                 });
             }
-            _ => {}
-        }
+            Ok(_) => None,
+            Err(failure) => Some(failure),
+        };
 
         // If OCR is enabled and we got empty content, try OCR
         if self.ocr_enabled && (is_pdf_extension(&extension) || is_image_extension(&extension)) {
@@ -534,13 +536,24 @@ impl DocumentProcessor {
             }
         }
 
-        // Fallback: try reading as text
-        let text = fs::read_to_string(input).with_context(|| {
-            format!(
-                "no converter available for {}, and file could not be read as UTF-8 text",
-                input.display()
-            )
-        })?;
+        // Fallback: try reading as text. A binary file whose conversion
+        // failed must surface that conversion failure, not an unrelated
+        // UTF-8 decoding error (ingestr-ayq3).
+        let text = match fs::read_to_string(input) {
+            Ok(text) => text,
+            Err(read_err) => {
+                if let Some(failure) = markitdown_failure {
+                    return Err(anyhow::anyhow!(failure)
+                        .context(format!("conversion failed for {}", input.display())));
+                }
+                return Err(read_err).with_context(|| {
+                    format!(
+                        "no converter available for {}, and file could not be read as UTF-8 text",
+                        input.display()
+                    )
+                });
+            }
+        };
 
         Ok(ConvertedDocument {
             title: None,

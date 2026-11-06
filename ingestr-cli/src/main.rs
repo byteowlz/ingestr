@@ -2440,16 +2440,18 @@ impl ConversionService {
             .to_str()
             .ok_or_else(|| anyhow!("invalid path encoding for {}", path.display()))?;
         let context = format!("converting {}", path.display());
-        let converted = if let Some(result) = safe_markitdown_convert(&context, || {
+        let converted = match safe_markitdown_convert(&context, || {
             self.markitdown.convert(path_str, conversion_opts)
         }) {
-            result
-        } else {
-            warn!(
-                "no converter available or converter failed for {}",
-                path.display()
-            );
-            return Ok(());
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                warn!("no converter available for {}", path.display());
+                return Ok(());
+            }
+            Err(failure) => {
+                warn!("markitdown failed for {}: {failure}", path.display());
+                return Ok(());
+            }
         };
 
         let converted_at = OffsetDateTime::now_utc()
